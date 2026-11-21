@@ -489,16 +489,141 @@ def test_two_proteins(two_proteins, real_run, tmp_path):
     assert len(one) == 36
 
 
+@pytest.mark.parametrize("equal_length", [False, True])
+@pytest.mark.parametrize("first_read", ["pose_block", "top_sdf"])
+def test_pose_reader_refreshes_after_replacement(res_copy, tmp_path, equal_length, first_read):
+    """A completed recommit refreshes both pose sections on an existing Results instance."""
+    r = res_copy
+    path = Path(r.path, "poses", f"{PID}.poses")
+    ligand = "ROOT\nENDROOT\nTORSDOF 0\n"
+
+    def commit(affinity, sdf):
+        raw = fe.render_pdbqt(ligand, [(affinity, 0.0, 0.0)]).encode()
+        # Uncompressed gzip members make equal-length replacements deterministic.
+        with ProteinWriter(PID, len(NAMES), [1], 1, tmp_path / "staged", {}, gzip_level=0) as w:
+            w.add_run(0, NAMES[0], 1, raw, "ok")
+            ResultsDir(r.path).commit(PID, w.finalize(lambda i, k, model: (sdf, "ok")), w.summary)
+        return raw
+
+    original_sdf = b"original top\n$$$$\n"
+    original = commit(-7.0, original_sdf)
+    assert r.pose_block(PID, NAMES[0], 1).encode() == original
+    assert r.top_sdf(PID, NAMES[0]).encode() == original_sdf
+    reader = r._readers[PID]
+    before = path.stat()
+    replacement_sdf = b"replaced top\n$$$$\n" + (b"" if equal_length else b"extra\n")
+    replacement = commit(-8.0, replacement_sdf)
+    after = path.stat()
+    assert (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+    assert (before.st_size == after.st_size) == equal_length
+    assert r.table("modes", PID)["affinity"].tolist() == [-8.0]
+    if first_read == "top_sdf":
+        assert r.top_sdf(PID, NAMES[0]).encode() == replacement_sdf
+    assert r.pose_block(PID, NAMES[0], 1).encode() == replacement
+    assert r.top_sdf(PID, NAMES[0]).encode() == replacement_sdf
+    assert reader.f.closed and r._readers[PID] is not reader
+
+
 def test_open_pose_files_are_bounded(two_proteins, monkeypatch):
     monkeypatch.setattr(results_mod, "MAX_OPEN_POSE_FILES", 1)
     r = two_proteins
     r.close()
     r.pose_block(PID, "molecule2", 1)
     first = r._readers[PID]
+    r.top_sdf(PID, "molecule2")
+    assert r._readers[PID] is first
     r.pose_block(PID2, "molecule2", 1)
     assert list(r._readers) == [PID2] and first.f.closed
+    assert set(r._reader_signatures) == {PID2}
+    second = r._readers[PID2]
     r.close()
-    assert r._readers == {} and r.pose_block(PID, "molecule2", 1)
+    assert r._readers == {} and r._reader_signatures == {} and second.f.closed
+    assert r.pose_block(PID, "molecule2", 1) and r._readers[PID] is not first
+    assert set(r._reader_signatures) == {PID}
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_pose_reader_replacement_failure_discards_cache(res_copy, tmp_path, monkeypatch, missing):
+    r = res_copy
+    original = r.pose_block(PID, NAMES[0], 1)
+    reader = r._readers[PID]
+    path = Path(r.path, "poses", f"{PID}.poses")
+    replacement = tmp_path / "replacement.poses"
+    shutil.copyfile(path, replacement)
+    if missing:
+        path.unlink()
+        error = FileNotFoundError
+    else:
+        replacement.replace(path)
+        error = PermissionError
+
+        def fail_open(path):
+            raise PermissionError("test open failure")
+
+        monkeypatch.setattr(results_mod.posefile, "Reader", fail_open)
+    with pytest.raises(error):
+        r.pose_block(PID, NAMES[0], 1)
+    assert reader.f.closed and r._readers == {} and r._reader_signatures == {}
+    monkeypatch.undo()
+    if missing:
+        replacement.replace(path)
+    assert r.pose_block(PID, NAMES[0], 1) == original
+
+
+@pytest.mark.parametrize("repeated", [False, True])
+def test_pose_reader_replacement_during_open(res_copy, tmp_path, monkeypatch, repeated):
+    r = res_copy
+    original = r.pose_block(PID, NAMES[0], 1)
+    cached = r._readers[PID]
+    path = Path(r.path, "poses", f"{PID}.poses")
+    replacement = tmp_path / "replacement.poses"
+    shutil.copyfile(path, replacement)
+    replacement.replace(path)
+    reader_type = results_mod.posefile.Reader
+    opened = []
+
+    def replacing_reader(path):
+        reader = reader_type(path)
+        opened.append(reader)
+        if repeated or len(opened) == 1:
+            shutil.copyfile(path, replacement)
+            replacement.replace(path)
+        return reader
+
+    with monkeypatch.context() as patch:
+        patch.setattr(results_mod.posefile, "Reader", replacing_reader)
+        if repeated:
+            with pytest.raises(OSError, match="changed repeatedly while opening"):
+                r.pose_block(PID, NAMES[0], 1)
+            assert len(opened) == 3 and all(reader.f.closed for reader in opened)
+            assert r._readers == {} and r._reader_signatures == {}
+        else:
+            assert r.pose_block(PID, NAMES[0], 1) == original
+            assert len(opened) == 2 and opened[0].f.closed
+            assert r._readers[PID] is opened[1] and not opened[1].f.closed
+            stat = os.fstat(opened[1].f.fileno())
+            assert r._reader_signatures[PID] == (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    assert cached.f.closed
+    assert r.pose_block(PID, NAMES[0], 1) == original
+
+
+def test_pose_reader_closes_if_path_disappears_during_open(res_copy, monkeypatch):
+    r = res_copy
+    path = Path(r.path, "poses", f"{PID}.poses")
+    reader_type = results_mod.posefile.Reader
+    opened = []
+
+    def disappearing_reader(path):
+        reader = reader_type(path)
+        opened.append(reader)
+        os.unlink(path)
+        return reader
+
+    monkeypatch.setattr(results_mod.posefile, "Reader", disappearing_reader)
+    with pytest.raises(FileNotFoundError):
+        r.pose_block(PID, NAMES[0], 1)
+    assert len(opened) == 1 and opened[0].f.closed
+    assert not path.exists() and r._readers == {} and r._reader_signatures == {}
 
 
 # --- combined_results.csv and exports ------------------------------------------------------------------------------

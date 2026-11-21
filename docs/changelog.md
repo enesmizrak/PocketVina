@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Existing `Results` instances refresh cached poses after a protein's results are replaced.
 - Docker images include the viewer assets needed for HTML and notebook 3D views.
 - The web app renders upload names, result values, and viewer errors as inert data while preserving 3D previews.
 - The web app limits downloads and 3D previews to registered uploads and files from its own docking runs.
