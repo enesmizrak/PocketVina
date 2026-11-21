@@ -61,6 +61,10 @@ def _text(data: bytes) -> str:
     return data.decode("utf-8", "surrogateescape")
 
 
+def _pose_file_signature(stat: os.stat_result) -> Tuple[int, int, int, int]:
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
 def short_floats(values) -> np.ndarray:
     """float32 scores as the float64 of their shortest decimal (``-5.2``, not ``-5.199999809``), i.e. the value the
     engine printed, so CSV exports match the legacy ``combined_results.csv`` text."""
@@ -114,6 +118,7 @@ class Results:
             raise ValueError(f"{self._dir.manifest_file}: format {manifest.get('format')!r}, expected {FORMAT!r}")
         self._manifest = manifest
         self._readers = OrderedDict()
+        self._reader_signatures = {}
         self._ligand_ids = None  # ligand_idx -> ligand_id
         self._ligand_index = None  # ligand_id -> ligand_idx
         self._n_heavy_by_idx = None  # ligand_idx -> heavy atoms of the docked fragment
@@ -133,7 +138,9 @@ class Results:
     def close(self):
         """Close the open pose files (they are reopened when needed)."""
         while self._readers:
-            self._readers.popitem()[1].close()
+            pid, reader = self._readers.popitem()
+            self._reader_signatures.pop(pid, None)
+            reader.close()
 
     # --- proteins and tables ---------------------------------------------------------------------------------------
 
@@ -476,12 +483,38 @@ class Results:
     # --- poses and structures --------------------------------------------------------------------------------------
 
     def _reader(self, pid: str) -> posefile.Reader:
+        path = os.path.join(self.path, "poses", f"{pid}.poses")
         reader = self._readers.pop(pid, None)
+        signature = self._reader_signatures.pop(pid, None)
+        if reader is not None:
+            try:
+                current = _pose_file_signature(os.stat(path))
+            except BaseException:
+                reader.close()
+                raise
+            if signature != current:
+                reader.close()
+                reader = None
         if reader is None:
-            reader = posefile.Reader(os.path.join(self.path, "poses", f"{pid}.poses"))
+            for _ in range(3):
+                reader = posefile.Reader(path)
+                try:
+                    # Use the opened descriptor: the path can be replaced while Reader opens it.
+                    signature = _pose_file_signature(os.fstat(reader.f.fileno()))
+                    if signature == _pose_file_signature(os.stat(path)):
+                        break
+                except BaseException:
+                    reader.close()
+                    raise
+                reader.close()
+            else:
+                raise OSError(f"pose file changed repeatedly while opening: {path}")
             while len(self._readers) >= MAX_OPEN_POSE_FILES:
-                self._readers.popitem(last=False)[1].close()
+                old_pid, old_reader = self._readers.popitem(last=False)
+                self._reader_signatures.pop(old_pid, None)
+                old_reader.close()
         self._readers[pid] = reader
+        self._reader_signatures[pid] = signature
         return reader
 
     def _block(self, protein, ligand, pocket) -> bytes:
