@@ -74,3 +74,6 @@ docs/dev/
 
 # local improvement plans and their evidence; kept out of the project
 /plans/
+
+# Reproducible benchmark definitions, never generated scientific results.
+!benchmark/protocols/*.json

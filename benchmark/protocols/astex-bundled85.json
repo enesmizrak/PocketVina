@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "name": "astex-bundled85",
+  "adapter": "astex",
+  "availability": "bundled-subset",
+  "dataset_root": null,
+  "cohort": {
+    "split_path": "benchmark/astex/data/timesplit_test_astex_diverse_set",
+    "split_sha256": "f4061ee7a410d639c0bda5cb2f4f724f584399c6677d9b5f26c6cb0c7bacda8d",
+    "expected_count": 85,
+    "exclusions": {}
+  },
+  "seeds": [
+    42,
+    43
+  ],
+  "preparation": "reference-sdf-topology-historical",
+  "settings": {
+    "box_length": 30,
+    "vina_threads": 8000,
+    "p2rank_threads": 8,
+    "p2rank_model": "alphafold",
+    "top_pockets": null
+  },
+  "run_label": "baseline-v1",
+  "top_k": 5,
+  "posebusters": false
+}
