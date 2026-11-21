@@ -97,6 +97,19 @@ bust.bust_results("results", select="best", workers=4)
 
 Outside Linux, put this code under `if __name__ == "__main__":` in a script.
 
+Protein loading has a separate limit from `--timeouts`: each worker has up to 600 seconds to load the protein
+before its per-pose check timer starts. Each protein check allows at most twice the configured worker count in
+failed protein loads, shared across its poses. Load deadline expiry, a loader rejecting the structure, or a worker
+dying during loading consumes this allowance. Loads already in progress reserve allowance and can finish within
+their own deadlines; successful loads release their reservations. Successful workers continue checking the queue,
+and get priority over starting more loads. The allowance resets for the next protein check.
+
+If the allowance is exhausted and no loaded or still-loading worker can continue, every unresolved pose is saved
+explicitly: `timeout` if all load failures exceeded their deadlines, or `error` if any load failed explicitly. The
+`error` column identifies protein loading as the cause. Completed checks and existing `no_pose` or `convert_failed`
+rows are preserved; no unresolved pose is marked valid or silently dropped. These shared loading failures do not
+consume the independent per-pose timeout retries. Disabling per-pose timeouts does not disable the loading limit.
+
 `posebusters` reads the saved checks of one protein, here with a few of their columns:
 
 ```python
@@ -112,7 +125,7 @@ pb[["ligand_id", "pocket", "mode", "pb_status", "failed_checks"]]
 | --- | --- |
 | `valid` | every check passed |
 | `invalid` | at least one check failed. `failed_checks` names them |
-| `timeout` | still running after the last timeout |
+| `timeout` | still running after the last per-pose timeout, or unresolved after the shared protein-load allowance was exhausted by load timeouts |
 | `error` | PoseBusters failed. The `error` column has the message |
 | `convert_failed` | the pose could not be turned into a molecule |
 | `no_pose` | the ligand has no pose in this protein |

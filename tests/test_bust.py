@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -362,6 +363,263 @@ def test_dead_worker_gives_error_rows(imported, tmp_path, monkeypatch, forked):
     assert df.pb_status.to_dict() == {"molecule2": "error", "molecule5": "error", "molecule10": "no_pose"}
     assert all("worker process died (exit code 3)" in e for e in df.error[:2])
     assert multiprocessing.active_children() == []
+
+
+@pytest.fixture
+def protein_load_pool(monkeypatch, tmp_path, forked):
+    """Real forked workers, synthetic poses, and a parent-visible count of loader starts."""
+    starts = multiprocessing.get_context("fork").Value("i", 0)
+    monkeypatch.setattr(bust, "PROTEIN_LOAD_TIMEOUT", 0.15)
+    monkeypatch.setattr(bust, "_new_posebusters", lambda cfg: SimpleNamespace(config=cfg))
+    monkeypatch.setattr(bust, "_check_pose", lambda pb, names, payload, protein, tmp:
+                        dict(values=[True], n_heavy=payload[1]))
+    pools = []
+
+    def make(load, workers=2, timeouts=(1, 2)):
+        def counted(*args):
+            with starts.get_lock():
+                starts.value += 1
+                number = starts.value
+            return load(number, *args)
+
+        monkeypatch.setattr(bust, "_load_protein", counted)
+        pool = bust._Pool({"modules": []}, workers, timeouts, str(tmp_path))
+        pools.append(pool)
+        return pool, starts
+
+    yield make
+    for pool in pools:
+        pool.close()
+    assert multiprocessing.active_children() == []
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("count", [1, 19])
+@pytest.mark.parametrize("failure", ["timeout", "negative_ack", "death"])
+def test_protein_load_budget_persistent_failures(protein_load_pool, count, failure):
+    def load(number, text, cfg, tmp):
+        if failure == "timeout":
+            time.sleep(60)
+        if failure == "death":
+            os._exit(7)
+        return None
+
+    pool, starts = protein_load_pool(load)
+    got = pool.check("protein", [lambda: ("sdf", 1)] * count)
+    assert starts.value == 4  # two failed loads per worker, independent of the number of poses
+    assert [g["status"] for g in got] == ["timeout" if failure == "timeout" else "error"] * count
+    assert all("protein" in g["error"] and "load" in g["error"] for g in got)
+    assert all(g["runtime_s"] >= 0 for g in got)
+    assert not pool.workers
+
+
+def test_protein_load_budget_recovers_on_next_protein(protein_load_pool):
+    def load(number, text, cfg, tmp):
+        return None if text == "broken" else object()
+
+    pool, starts = protein_load_pool(load, workers=1)
+    assert all(g["status"] == "error" for g in pool.check("broken", [lambda: ("sdf", 1)] * 9))
+    assert starts.value == 2
+    got = pool.check("healthy", [lambda i=i: ("sdf", i) for i in range(9)])
+    assert [g["n_heavy"] for g in got] == list(range(9))
+    assert starts.value == 3
+
+
+def test_protein_load_budget_transient_failure(protein_load_pool):
+    pool, starts = protein_load_pool(lambda number, *args: None if number == 1 else object(), workers=1)
+    got = pool.check("protein", [lambda i=i: ("sdf", i) for i in range(8)])
+    assert [g["n_heavy"] for g in got] == list(range(8))
+    assert starts.value == 2
+
+
+def test_protein_load_budget_healthy_peer_finishes_queue(protein_load_pool):
+    def load(number, *args):
+        if number == 1:
+            time.sleep(60)
+        return object()
+
+    pool, starts = protein_load_pool(load)
+    got = pool.check("protein", [lambda i=i: ("sdf", i) for i in range(15)])
+    assert [g["n_heavy"] for g in got] == list(range(15))
+    assert starts.value == 2  # retry the stalled loader's pose on the healthy peer
+
+
+def test_protein_load_budget_payload_error_is_local(protein_load_pool):
+    def broken():
+        raise ValueError("bad payload")
+
+    pool, starts = protein_load_pool(lambda *args: object(), workers=1)
+    got = pool.check("protein", [lambda: ("sdf", 0), broken, lambda: ("sdf", 2)])
+    assert got[0]["n_heavy"] == 0 and got[2]["n_heavy"] == 2
+    assert got[1]["error"] == "cannot read the pose: ValueError: bad payload"
+    assert starts.value == 1
+
+
+@pytest.fixture
+def protein_load_clock(monkeypatch, tmp_path):
+    """Deterministic pipe/clock doubles for concurrent reservation and deadline boundaries."""
+    clock, starts, killed = [0.0], [], []
+
+    def make(loads, pose_failure=None, pose_delay=0.25):
+        class Worker:
+            def __init__(self, *args):
+                self.conn = self
+                self.proc = SimpleNamespace(join=lambda timeout: None)
+                self.protein = self.task = self.deadline = self.started = None
+                self.loaded = False
+                self.messages = []
+
+            def send(self, msg):
+                if msg[0] == "protein":
+                    starts.append(clock[0])
+                    outcome, delay = loads[len(starts) - 1]
+                    self.outcome, self.at = outcome, clock[0] + delay
+                    if outcome != "timeout":
+                        reply = None if outcome == "death" else ("protein", msg[1],
+                                                                 "bad protein" if outcome == "error" else None)
+                        self.messages.append((self.at, reply))
+                elif msg[0] == "pose" and self.outcome == "ok":
+                    if pose_failure == "death":
+                        reply = None
+                    else:
+                        reply = ("pose", msg[1], dict(values=[True], n_heavy=msg[2][1], runtime_s=0.25))
+                    if pose_failure != "timeout":
+                        self.messages.append((max(clock[0], self.at) + pose_delay, reply))
+                return True
+
+            def poll(self, timeout):
+                return bool(self.messages and self.messages[0][0] <= clock[0])
+
+            def recv(self):
+                _, msg = self.messages.pop(0)
+                if msg is None:
+                    raise EOFError
+                return msg
+
+            def exit_code(self):
+                return 9
+
+            def kill(self):
+                killed.append(self)
+
+        def wait(conns, timeout):
+            deadlines = [w.messages[0][0] for w in conns if w.messages]
+            if timeout is not None:
+                deadlines.append(clock[0] + timeout)
+            assert deadlines, "scheduler has neither a reply nor a deadline"
+            clock[0] = min(deadlines)
+            return [w for w in conns if w.poll(0)]
+
+        monkeypatch.setattr(bust, "_Worker", Worker)
+        monkeypatch.setattr(bust, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+        monkeypatch.setattr(bust, "wait_connections", wait)
+        monkeypatch.setattr(bust, "PROTEIN_LOAD_TIMEOUT", 10)
+        return bust._Pool({"modules": []}, 2, (1, 2), str(tmp_path)), starts, killed
+
+    return make
+
+
+def test_protein_load_budget_reserves_inflight_success(protein_load_clock):
+    pool, starts, killed = protein_load_clock([("error", 1), ("ok", 5), ("error", 1), ("error", 1)], pose_delay=0)
+    try:
+        got = pool.check("protein", [lambda i=i: ("sdf", i) for i in range(2)])
+        assert [g["n_heavy"] for g in got] == [0, 1]
+        assert starts == [0, 0, 1, 2]  # the fourth reservation blocks another load until the healthy ack
+        assert len(killed) == 3
+    finally:
+        pool.close()
+
+
+def test_protein_load_budget_mixed_failures_keep_error_provenance(protein_load_clock):
+    pool, starts, killed = protein_load_clock([("error", 1)] + [("timeout", 60)] * 3)
+    got = pool.check("protein", [lambda: ("sdf", 1)] * 9)
+    assert len(starts) == len(killed) == 4 and not pool.workers
+    assert [g["status"] for g in got] == ["error"] * 9
+    assert all(g["error"].endswith("bad protein") for g in got)
+    assert [g["runtime_s"] for g in got] == [1, 10, 10, 10, 0, 0, 0, 0, 0]
+
+
+def test_protein_load_budget_exhausted_healthy_worker_continues(protein_load_clock):
+    pool, starts, killed = protein_load_clock([("ok", 0)] + [("error", 0.01)] * 4)
+    try:
+        got = pool.check("protein", [lambda i=i: ("sdf", i) for i in range(9)])
+        assert [g["n_heavy"] for g in got] == list(range(9))
+        assert len(starts) == 5 and len(killed) == 4
+    finally:
+        pool.close()
+
+
+@pytest.mark.parametrize("failure", ["death", "timeout"])
+def test_protein_load_budget_postload_failures_are_per_pose(protein_load_clock, failure):
+    pool, starts, killed = protein_load_clock([("ok", 0)] * 12, pose_failure=failure)
+    got = pool.check("protein", [lambda: ("sdf", 1)] * 6)
+    assert [g["status"] for g in got] == ["error" if failure == "death" else "timeout"] * 6
+    assert len(starts) == len(killed) == (6 if failure == "death" else 12)
+    assert all("load budget" not in g["error"] for g in got)
+    if failure == "timeout":
+        assert [g["runtime_s"] for g in got] == [3] * 6
+
+
+def test_protein_load_budget_cancellation_joins_loaders(protein_load_pool):
+    def load(number, text, *args):
+        if text == "stalled":
+            time.sleep(60)
+        return object()
+
+    busy = []
+
+    def cancel():
+        busy.append(pool.workers[0].proc)
+        raise KeyboardInterrupt
+
+    pool, starts = protein_load_pool(load)
+    with pytest.raises(KeyboardInterrupt):
+        pool.check("stalled", [lambda: ("sdf", 0), cancel])
+    assert all(w.task is None for w in pool.workers) and not busy[0].is_alive()
+    got = pool.check("healthy", [lambda: ("sdf", 1)])
+    assert got[0]["n_heavy"] == 1
+
+
+@pytest.mark.parametrize("failure", ["timeout", "negative_ack"])
+def test_protein_load_budget_saved_masks_and_upstream_statuses(imported, tmp_path, monkeypatch, forked, failure):
+    starts = multiprocessing.get_context("fork").Value("i", 0)
+    number, worker_init = [0], bust._Worker.__init__
+
+    def numbered_worker(self, *args, **kwargs):
+        number[0] += 1  # assigned before fork, inherited by that worker
+        worker_init(self, *args, **kwargs)
+
+    def load(*args):
+        with starts.get_lock():
+            starts.value += 1
+        if failure == "timeout":
+            time.sleep(60)
+        return None
+
+    monkeypatch.setattr(bust._Worker, "__init__", numbered_worker)
+    monkeypatch.setattr(bust, "_new_posebusters", lambda cfg: SimpleNamespace(config=cfg))
+    monkeypatch.setattr(bust, "_load_protein", load)
+    monkeypatch.setattr(bust, "PROTEIN_LOAD_TIMEOUT", 0.2)
+    original = bust._select_poses
+
+    def select(*args):
+        poses = original(*args)
+        poses[1] = poses[1]._replace(status="convert_failed", error="existing conversion failure", source=None)
+        return poses
+
+    monkeypatch.setattr(bust, "_select_poses", select)
+    path = copy_results(imported, tmp_path)
+    assert bust.bust_results(path, workers=WORKERS, tmp_dir=str(tmp_path / "tmp")) == [PID]
+    with Results(path) as r:
+        df = r.posebusters(PID)
+    assert df.pb_status.tolist() == ["timeout" if failure == "timeout" else "error", "convert_failed", "no_pose"]
+    assert df.ligand_id.tolist() == ["molecule2", "molecule5", "molecule10"]
+    assert df.pb_valid.isna().all() and df.pb_mask.tolist() == [0, 0, 0]
+    assert df.pb_na_mask.tolist() == [ALL_BITS] * 3 and df.n_heavy_docked.isna().all()
+    assert df.error[1] == "existing conversion failure" and df.error[2] == "the ligand has no docked pose"
+    assert df.runtime_s[0] > 0 and df.runtime_s[1:].isna().all()
+    assert starts.value == number[0] == 4
+    assert multiprocessing.active_children() == [] and os.listdir(tmp_path / "tmp") == []
 
 
 def test_unreadable_structure_gives_error_rows(imported, tmp_path):

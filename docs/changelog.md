@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Repeated PoseBusters protein-load failures are bounded per protein independently of the number of poses.
+  Healthy workers continue checking; unresolved poses get explicit load-related timeout or error results.
 - An Atlas instance can refresh its SAS or ChEMBL listing on a later call after a failed refresh, preserving usable
   cached data and allowing recovery without clearing the cache or creating another instance.
 - Resuming atlas runs verifies stored structure and supplied pocket CSV fingerprints before reusing completed
