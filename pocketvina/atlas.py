@@ -615,6 +615,7 @@ class Atlas:
         self._chembl_files: Optional[Dict[str, list]] = None  # chembl_any/MANIFEST.json, read on first use
         self._chembl_strict: Optional[dict] = None  # chembl_any/strict.json.gz, read on first use
         self._fetched_again: set = set()  # sas/ and chembl_any/ listings fetched again (_fetch_listing_again)
+        self._listing_refresh_attempts: Dict[str, int] = {}  # includes failed attempts, for coordination within a call
 
     def _read_meta(self) -> dict:
         where = self.source.location
@@ -1046,6 +1047,7 @@ class Atlas:
             logger.warning('%s: the page is shown without the "ChEMBL Complete" values, which cannot be read: %s',
                            uniprot, e)
             return None, {"pvl": {}, "xo": {}}
+        attempts = self._listing_refresh_attempts.get(CHEMBL_MANIFEST, 0)
         try:
             records = self._chembl_json(f"proteins/{uniprot}.json.gz")
             if records is not None:
@@ -1056,7 +1058,8 @@ class Atlas:
             records = None
         else:
             records = records if records is not None else {"d": {}}
-        return records, self._strict_links()
+        refresh_listing = self._listing_refresh_attempts.get(CHEMBL_MANIFEST, 0) == attempts
+        return records, self._strict_links(refresh_listing=refresh_listing)
 
     def _chembl_listing(self) -> dict:
         """chembl_any/MANIFEST.json, {"<path in chembl_any/>": [sha256, bytes]}, read once; {} when the release has no
@@ -1071,9 +1074,10 @@ class Atlas:
             self._chembl_files = listed
         return self._chembl_files
 
-    def _chembl_json(self, rel: str):
+    def _chembl_json(self, rel: str, refresh_listing: bool = True):
         """A file of chembl_any/ (``rel``: its path there, e.g. "strict.json.gz"), checked against
-        chembl_any/MANIFEST.json and parsed; None if the listing does not have it."""
+        chembl_any/MANIFEST.json and parsed; None if the listing does not have it. ``refresh_listing=False`` keeps a
+        protein listing refresh attempt from triggering another while reading its strict links."""
         entry = self._chembl_listing().get(rel)
         if entry is None:
             return None
@@ -1082,7 +1086,7 @@ class Atlas:
         try:
             path = self.source.file(f"{CHEMBL_DIR}/{rel}", size=entry[1], sha256=entry[0])
         except ValueError:  # not the file the listing says: the listing in the cache may be older than the file
-            if not self._fetch_listing_again(CHEMBL_MANIFEST):
+            if not refresh_listing or not self._fetch_listing_again(CHEMBL_MANIFEST):
                 raise
             return self._chembl_json(rel)
         with open(path, "rb") as f:
@@ -1093,33 +1097,42 @@ class Atlas:
         """Over HTTP, once per Atlas: a listing (SAS_MANIFEST or CHEMBL_MANIFEST) fetched again from the server into
         the cache, as the site may have made its folder again since the cache got it (download() does it first; a
         page, when a file does not match the listing). The listing and what was read with it are then read again.
-        False for a folder, or when it was done already (a file that still does not match is damaged). ValueError
-        when the answer is not a listing (the one in the cache is kept), OSError without network."""
+        False for a folder, during a refresh, or after a completed attempt (a file that still does not match is
+        damaged). A missing listing completes the attempt too. ValueError when the answer is not a listing (the one
+        in the cache is kept), OSError without network; failed attempts leave the listing eligible for a later call."""
         if self.source.url is None or listing in self._fetched_again:
             return False
         self._fetched_again.add(listing)
+        self._listing_refresh_attempts[listing] = self._listing_refresh_attempts.get(listing, 0) + 1
+        completed = False
         try:
-            self.source._fetch_again(listing)
-        except FileNotFoundError:  # the release has no such folder
-            pass
+            try:
+                self.source._fetch_again(listing)
+            except FileNotFoundError:  # the release has no such folder
+                pass
+            completed = True
+        finally:
+            if not completed:
+                self._fetched_again.discard(listing)
         if listing == SAS_MANIFEST:
             self._sas_files = None
         else:
             self._chembl_files = self._chembl_strict = None
         return True
 
-    def _strict_links(self) -> dict:
+    def _strict_links(self, refresh_listing: bool = True) -> dict:
         """chembl_any/strict.json.gz, {"pvl": {PVL: [parent ChEMBL IDs]}, "xo": {PVL: name}} and, if it has it,
         "moa": {catalogue number: [UniProt]}, read once: the links of the strict ChEMBL values, the other drug a
         value's structure is, and the mechanisms ChEMBL records on a salt or alternative form of a drug
         (``_with_salt_forms``). A file without "moa" (made before the site added it, 19 Nov 2026) leaves the release's
         flags as they are; over HTTP such a copy in the cache has its listing fetched again once, as the server's file
         may be newer. Empty without the file, and when it cannot be read now (a warning; read again next time): the
-        strict values are then as on a release without chembl_any/."""
+        strict values are then as on a release without chembl_any/. ``refresh_listing=False`` reads usable links
+        without starting another refresh after the protein path already attempted one in the same call."""
         if self._chembl_strict is None:
             try:
-                links = _check_strict(self._chembl_json(CHEMBL_STRICT))
-                if "moa" not in links:
+                links = _check_strict(self._chembl_json(CHEMBL_STRICT, refresh_listing=refresh_listing))
+                if refresh_listing and "moa" not in links:
                     links = self._newer_strict_links(links)
             except (OSError, ValueError, EOFError, zlib.error) as e:
                 logger.warning('the "ChEMBL Strict" values of the page have fewer links and leave out mechanisms on '
@@ -1132,14 +1145,13 @@ class Atlas:
         """strict.json.gz read again after its listing is fetched again (over HTTP, once per Atlas:
         ``_fetch_listing_again``), for a file without "moa" that may be an older copy in the cache. ``links`` as they
         are for a folder, without network, or when the server's answer cannot be used (no warning: they are what the
-        page had before). Without an answer (e.g. no network now) the listing may be fetched again later, e.g. by
-        download(); this runs once per Atlas either way (``_strict_links`` keeps what it returns)."""
+        page had before). If fetching the listing fails (e.g. no network now), it may be fetched again later, e.g.
+        by download(); a successful listing stays completed even if reading the strict file then fails. This runs
+        once per Atlas either way (``_strict_links`` keeps what it returns)."""
         try:
             if self._fetch_listing_again(CHEMBL_MANIFEST):
                 return _check_strict(self._chembl_json(CHEMBL_STRICT))
-        except OSError:
-            self._fetched_again.discard(CHEMBL_MANIFEST)
-        except (ValueError, EOFError, zlib.error):
+        except (OSError, ValueError, EOFError, zlib.error):
             pass
         return links
 

@@ -1640,6 +1640,59 @@ def test_sas_points_made_again(atlas_dir, tmp_path, http_server, monkeypatch, ca
     assert not caplog.text
 
 
+@pytest.mark.parametrize("folder", ["sas", "chembl_any"])
+def test_listing_refresh_failure_recovers_on_the_same_atlas(folder, atlas_dir, tmp_path, http_server, monkeypatch,
+                                                          caplog):
+    """A failed mismatch refresh keeps old cached data usable and can recover on a later call to the same Atlas."""
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+    release = Path(shutil.copytree(atlas_dir, tmp_path / "v1.1"))
+    server = http_server(release)
+    atlas = Atlas(server.url)
+
+    def read(uniprot):
+        return atlas._sas(uniprot) if folder == "sas" else atlas._chembl(uniprot)
+
+    old = read(ABL1)  # cache the old listing and ABL1, leaving EGFR uncached
+    listing = f"{folder}/MANIFEST.json"
+    cached = next(cache.rglob(listing))
+    kept = cached.read_bytes()
+    parsed = atlas._sas_files if folder == "sas" else atlas._chembl_files
+    new = _make_sas_again(release) if folder == "sas" else _make_chembl_again(release)
+    expected = new[EGFR] if folder == "sas" else (new[f"proteins/{EGFR}.json.gz"], new["strict.json.gz"])
+    fetch_again = atlas.source._fetch_again
+    attempts = []
+
+    def fail_once(rel):
+        attempts.append(rel)
+        assert not atlas._fetch_listing_again(rel)  # an in-progress refresh cannot reenter
+        raise ConnectionError("synthetic listing refresh failure")
+
+    with caplog.at_level(logging.WARNING, logger="pocketvina.atlas"):
+        with monkeypatch.context() as m:
+            m.setattr(atlas.source, "_fetch_again", fail_once)
+            assert read(EGFR) == (None if folder == "sas" else (None, old[1]))
+        assert attempts == [listing]  # no retry inside the failed call
+        assert "synthetic listing refresh failure" in caplog.text
+        assert cached.read_bytes() == kept
+        assert (atlas._sas_files if folder == "sas" else atlas._chembl_files) is parsed
+        caplog.clear()
+        assert read(ABL1) == old and not caplog.text
+
+        def counted_fetch(rel):
+            attempts.append(rel)
+            return fetch_again(rel)
+
+        monkeypatch.setattr(atlas.source, "_fetch_again", counted_fetch)
+        assert read(EGFR) == expected
+        assert read(EGFR) == expected
+        assert attempts == [listing, listing]
+        assert atlas._fetched_again == {listing}
+    assert not caplog.text
+    assert cached.read_bytes() == (release / listing).read_bytes()
+    assert not [p for p in cache.rglob("*") if ".tmp-" in p.name or ".fetched-" in p.name]
+
+
 def test_download_after_listings_made_again(atlas_dir, tmp_path, http_server, monkeypatch, caplog):
     """download() fetches sas/MANIFEST.json and chembl_any/MANIFEST.json from the server first (not the ones in the
     cache, which may be older): after the site made sas/ and chembl_any/ again its copy is as the new listings say."""
@@ -1746,9 +1799,10 @@ def test_listings_fetched_again_keep_the_cache_on_a_bad_answer(atlas_dir, tmp_pa
         (release / rel).write_bytes(page)
     with caplog.at_level(logging.WARNING, logger="pocketvina.atlas"):
         atlas = Atlas(server.url)
+        asked = len(server.requests)
         assert atlas._sas(EGFR) is None and atlas._chembl(EGFR) == (None, old[1][1])
         assert caplog.text.count("is not a listing of files (JSON)") == 2
-        assert atlas._fetched_again == {"sas/MANIFEST.json", "chembl_any/MANIFEST.json"}
+        assert not atlas._fetched_again
         caplog.clear()
         assert (atlas._sas(ABL1), atlas._chembl(ABL1)) == old
         later = Atlas(server.url)
@@ -1756,7 +1810,72 @@ def test_listings_fetched_again_keep_the_cache_on_a_bad_answer(atlas_dir, tmp_pa
     assert not caplog.text
     for rel in ("sas/MANIFEST.json", "chembl_any/MANIFEST.json"):
         assert next((tmp_path / "cache").rglob(rel)).read_bytes() == (atlas_dir / rel).read_bytes()
+    for rel in ("sas/MANIFEST.json", "chembl_any/MANIFEST.json", f"sas/{EGFR}.json.gz",
+                f"chembl_any/proteins/{EGFR}.json.gz"):
+        (release / rel).write_bytes((atlas_dir / rel).read_bytes())
+    points, records = _make_sas_again(release), _make_chembl_again(release)
+    assert atlas._sas(EGFR) == points[EGFR]
+    assert atlas._chembl(EGFR) == (records[f"proteins/{EGFR}.json.gz"], records["strict.json.gz"])
+    assert atlas._sas(EGFR) == points[EGFR]
+    assert atlas._chembl(EGFR) == (records[f"proteins/{EGFR}.json.gz"], records["strict.json.gz"])
+    assert atlas._fetched_again == {"sas/MANIFEST.json", "chembl_any/MANIFEST.json"}
+    for rel in atlas._fetched_again:
+        assert [r for r, _ in server.requests[asked:]].count(rel) == 2  # bad answer, then one successful refresh
+        assert next((tmp_path / "cache").rglob(rel)).read_bytes() == (release / rel).read_bytes()
+    assert not caplog.text
     assert not [p for p in (tmp_path / "cache").rglob("*") if ".tmp-" in p.name or ".fetched-" in p.name]
+
+
+@pytest.mark.parametrize("folder", ["sas", "chembl_any"])
+def test_listing_refresh_definitive_404_is_completed(folder, atlas_dir, tmp_path, http_server, monkeypatch, caplog):
+    """A missing supplemental listing is definitive for this Atlas, even if the server later restores it."""
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+    release = Path(shutil.copytree(atlas_dir, tmp_path / "v1.1"))
+    server = http_server(release)
+    atlas = Atlas(server.url)
+
+    def read(uniprot):
+        return atlas._sas(uniprot) if folder == "sas" else atlas._chembl(uniprot)
+
+    old = read(ABL1)
+    listing = f"{folder}/MANIFEST.json"
+    kept = next(cache.rglob(listing)).read_bytes()
+    (_make_sas_again if folder == "sas" else _make_chembl_again)(release)
+    published = (release / listing).read_bytes()
+    (release / listing).unlink()
+    asked = len(server.requests)
+    with caplog.at_level(logging.WARNING, logger="pocketvina.atlas"):
+        assert read(EGFR) == (None if folder == "sas" else (None, old[1]))
+        assert "damaged" in caplog.text
+        assert atlas._fetched_again == {listing}
+        (release / listing).write_bytes(published)
+        assert read(EGFR) == (None if folder == "sas" else (None, old[1]))
+        assert not atlas._fetch_listing_again(listing)
+        caplog.clear()
+        assert read(ABL1) == old and not caplog.text
+    assert [r for r, _ in server.requests[asked:]].count(listing) == 1
+    assert next(cache.rglob(listing)).read_bytes() == kept
+    assert not [p for p in cache.rglob("*") if ".tmp-" in p.name or ".fetched-" in p.name]
+
+
+@pytest.mark.parametrize("listing", ["sas/MANIFEST.json", "chembl_any/MANIFEST.json"])
+def test_listing_refresh_failure_on_cancellation_keeps_parsed_data(listing, atlas_dir, monkeypatch):
+    """Cancellation propagates while releasing the in-progress marker and retaining parsed listings."""
+    atlas = Atlas(atlas_dir)
+    points, records = atlas._sas_listing(), atlas._chembl_listing()
+    strict = atlas._strict_links()
+    monkeypatch.setattr(atlas.source, "url", "http://unused.invalid/")
+
+    def cancel(rel):
+        assert rel == listing and not atlas._fetch_listing_again(rel)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(atlas.source, "_fetch_again", cancel)
+    with pytest.raises(KeyboardInterrupt):
+        atlas._fetch_listing_again(listing)
+    assert not atlas._fetched_again
+    assert atlas._sas_files is points and atlas._chembl_files is records and atlas._chembl_strict is strict
 
 
 def _put_strict(release: Path, data: dict) -> dict:
@@ -1767,6 +1886,121 @@ def _put_strict(release: Path, data: dict) -> dict:
     listing.write_text(json.dumps(dict(json.loads(listing.read_text()), **{
         "strict.json.gz": [hashlib.sha256(raw).hexdigest(), len(raw)]}), indent=0))
     return data
+
+
+@pytest.mark.parametrize("legacy_strict", [False, True], ids=["digest_mismatch", "legacy_upgrade"])
+def test_chembl_protein_404_allows_independent_strict_refresh(legacy_strict, atlas_dir, tmp_path, http_server,
+                                                           monkeypatch, caplog):
+    """A protein 404 does not consume the listing attempt needed for independent strict-file recovery."""
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+    release = Path(shutil.copytree(atlas_dir, tmp_path / "v1.1"))
+    new = _chembl_json(atlas_dir, "strict.json.gz")
+    old = _put_strict(release, {k: v for k, v in new.items() if k != "moa"}) if legacy_strict else new
+    server = http_server(release)
+    atlas = Atlas(server.url)
+    atlas._chembl_listing()  # prime only the old listing, leaving EGFR and usually strict uncached
+    if legacy_strict:
+        assert atlas._chembl_json("strict.json.gz") == old
+    new["xo"]["PVL99999"] = "ANOTHER DRUG"
+    _put_strict(release, new)
+    (release / "chembl_any" / "proteins" / f"{EGFR}.json.gz").unlink()
+    asked = len(server.requests)
+    with caplog.at_level(logging.WARNING, logger="pocketvina.atlas"):
+        assert atlas._chembl(EGFR) == (None, new)
+        assert atlas._chembl(EGFR) == (None, new)
+        assert caplog.text.count(f'{EGFR}: the page is shown without the "ChEMBL Complete" values') == 2
+        assert 'the "ChEMBL Strict" values of the page have fewer links' not in caplog.text
+    assert [r for r, _ in server.requests[asked:]].count("chembl_any/MANIFEST.json") == 1
+    assert atlas._fetched_again == {"chembl_any/MANIFEST.json"}
+    assert atlas._chembl_strict == new and new["moa"]
+    assert not [p for p in cache.rglob("*") if ".tmp-" in p.name or ".fetched-" in p.name]
+
+
+@pytest.mark.parametrize("cached_strict", [False, True], ids=["digest_mismatch", "without_moa"])
+def test_chembl_refresh_failure_waits_for_next_call_with_legacy_strict(cached_strict, atlas_dir, tmp_path,
+                                                                     http_server, monkeypatch, caplog):
+    """Neither a strict digest mismatch nor missing moa can retry a failed listing refresh in the same call."""
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+    release = Path(shutil.copytree(atlas_dir, tmp_path / "v1.1"))
+    strict = _chembl_json(atlas_dir, "strict.json.gz")
+    old_strict = _put_strict(release, {k: v for k, v in strict.items() if k != "moa"})
+    server = http_server(release)
+    assert Atlas(server.url)._chembl(ABL1)[1] == old_strict  # cache old data, leaving EGFR uncached
+    new = _make_chembl_again(release)
+    _put_strict(release, strict)
+    atlas = Atlas(server.url)  # this object's allowance has not been consumed
+    cached = next(cache.rglob("chembl_any/MANIFEST.json"))
+    kept = cached.read_bytes()
+    strict_cache = next(cache.rglob("chembl_any/strict.json.gz"))
+    kept_strict = strict_cache.read_bytes() if cached_strict else None
+    if not cached_strict:
+        strict_cache.unlink()  # strict data must be fetched and will mismatch the old listing
+    fetch_again = atlas.source._fetch_again
+    attempts = []
+
+    def fail_once(rel):
+        attempts.append(rel)
+        if len(attempts) == 1:
+            raise ConnectionError("synthetic listing refresh failure with legacy strict")
+        return fetch_again(rel)
+
+    monkeypatch.setattr(atlas.source, "_fetch_again", fail_once)
+    with caplog.at_level(logging.WARNING, logger="pocketvina.atlas"):
+        records, links = atlas._chembl(EGFR)
+        assert records is None
+        assert attempts == ["chembl_any/MANIFEST.json"]
+        assert links == (old_strict if cached_strict else {"pvl": {}, "xo": {}})
+        assert atlas._chembl_strict == (old_strict if cached_strict else None)
+        assert not atlas._fetched_again
+        assert cached.read_bytes() == kept
+        if cached_strict:
+            assert strict_cache.read_bytes() == kept_strict
+        else:
+            assert not strict_cache.exists()
+        assert caplog.text.count("synthetic listing refresh failure with legacy strict") == 1
+        caplog.clear()
+        assert atlas._chembl(EGFR) == (new[f"proteins/{EGFR}.json.gz"], strict)
+        assert atlas._chembl(EGFR) == (new[f"proteins/{EGFR}.json.gz"], strict)
+        assert attempts == ["chembl_any/MANIFEST.json"] * 2
+        assert atlas._fetched_again == {"chembl_any/MANIFEST.json"}
+    assert not caplog.text
+    assert not [p for p in cache.rglob("*") if ".tmp-" in p.name or ".fetched-" in p.name]
+
+
+def test_listing_refresh_success_survives_strict_file_load_failure(atlas_dir, tmp_path, http_server, monkeypatch,
+                                                                  caplog):
+    """A strict-file failure after a published listing keeps old links without releasing the completed marker."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    release = Path(shutil.copytree(atlas_dir, tmp_path / "v1.1"))
+    new = _chembl_json(atlas_dir, "strict.json.gz")
+    old = _put_strict(release, {k: v for k, v in new.items() if k != "moa"})
+    server = http_server(release)
+    assert Atlas(server.url)._chembl(ABL1)[1] == old
+    _put_strict(release, new)
+    atlas = Atlas(server.url)
+    source_file = atlas.source.file
+    listing = "chembl_any/MANIFEST.json"
+    failed = []
+
+    def fail_after_listing(rel, **kwargs):
+        if rel == "chembl_any/strict.json.gz" and listing in atlas._fetched_again and not failed:
+            failed.append(rel)
+            raise ConnectionError("synthetic strict-file failure")
+        return source_file(rel, **kwargs)
+
+    monkeypatch.setattr(atlas.source, "file", fail_after_listing)
+    asked = len(server.requests)
+    with caplog.at_level(logging.WARNING, logger="pocketvina.atlas"):
+        assert atlas._chembl(ABL1)[1] == old
+        assert failed == ["chembl_any/strict.json.gz"]
+        assert atlas._fetched_again == {listing}
+        assert not atlas._fetch_listing_again(listing)
+        assert atlas._chembl(EGFR)[1] == old  # the established fallback is kept
+        assert atlas._chembl_json("strict.json.gz") == new  # later data reads can still recover
+    assert [r for r, _ in server.requests[asked:]].count(listing) == 1
+    assert not caplog.text
 
 
 def test_chembl_strict_without_moa(atlas_dir, tmp_path, http_server, monkeypatch, caplog):
