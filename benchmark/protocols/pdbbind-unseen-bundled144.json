@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "name": "pdbbind-unseen-bundled144",
+  "adapter": "pdbbind",
+  "availability": "bundled-subset",
+  "dataset_root": null,
+  "cohort": {
+    "split_path": "benchmark/pdbbind/data/timesplit_test_no_rec_overlap",
+    "split_sha256": "830b4026b47fa864b5358c0847342f3a55d36ca99e0ab6d695c63e3f781153ae",
+    "expected_count": 144,
+    "exclusions": {}
+  },
+  "seeds": [
+    42,
+    43
+  ],
+  "preparation": "reference-sdf-topology-historical",
+  "settings": {
+    "box_length": 23,
+    "vina_threads": 8000,
+    "p2rank_threads": 8,
+    "p2rank_model": "alphafold",
+    "top_pockets": null
+  },
+  "run_label": "baseline-v1",
+  "top_k": 5,
+  "posebusters": false
+}

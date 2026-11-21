@@ -1,0 +1,4 @@
+# Repository-only full evaluation tools; protocol/help/dry-run/accounting need none of these.
+# Install PocketVina and its existing runtime dependencies separately.
+networkx
+spyrmsd

@@ -2,6 +2,14 @@
 
 ## Not released yet
 
+### Added
+
+- Repository-only benchmark protocol manifests and one shared runner for PDBbind, Astex, PoseBusters and DockGen.
+  Requested-case ledgers retain failures in success denominators and separate oracle sampling, affinity-ranked
+  top-1/top-k and observed PoseBusters-valid success from evaluated-only median RMSD. Explicit preparation recipes,
+  seeds, cohort/input/tool identities, dependency-light dry-runs and CPU contracts establish the evaluation
+  foundation; bundled subsets are named explicitly and no real GPU accuracy baseline is claimed.
+
 ### Changed
 
 - Clarified atlas `dock --force` help and documentation: replacing the run definition retains completed proteins
