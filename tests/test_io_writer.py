@@ -365,6 +365,187 @@ def test_check_protein_id_rejects(bad):
 
 # --- ResultsDir ----------------------------------------------------------------------------------------------------
 
+def initialization_files(root):
+    """The single elected snapshot in an ordinary run, independently checked against its canonical bytes."""
+    rd = ResultsDir(root)
+    manifest = rd.run_manifest()
+    ref = manifest["initial_ligands"]
+    path = Path(root, ref["path"])
+    assert path.parent == Path(root, "initialization")
+    assert path.name.startswith("ligands-" + manifest["ligands_sha256"] + "-")
+    assert pq.read_schema(path).equals(tables.LIGANDS)
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == ref["sha256"]
+    assert wr.ligands_sha256(read_table(path)) == manifest["ligands_sha256"]
+    assert path.read_bytes() == Path(rd.ligands_file).read_bytes()
+    return {ref["path"]}
+
+
+def test_initialization_recovers_elected_conformer(tmp_results, monkeypatch):
+    rd = ResultsDir(tmp_results)
+    first = ligands_df(pdbqt="ATOM first coordinates")
+    second = ligands_df(pdbqt="ATOM second coordinates")
+    real_place = wr.atomic_place
+
+    def interrupted(src, dst):
+        if dst == rd.ligands_file:
+            raise RuntimeError("initialization interrupted")
+        return real_place(src, dst)
+
+    monkeypatch.setattr(wr, "atomic_place", interrupted)
+    with pytest.raises(RuntimeError, match="initialization interrupted"):
+        rd.init_run({}, first)
+    elected = Path(rd.manifest_file).read_bytes()
+    monkeypatch.setattr(wr, "atomic_place", real_place)
+    with pytest.raises(ValueError, match="other ligands"):
+        rd.init_run({}, second)
+    pd.testing.assert_frame_equal(read_table(rd.ligands_file), tables.to_arrow(first, tables.LIGANDS).to_pandas())
+    assert Path(rd.manifest_file).read_bytes() == elected
+
+
+@pytest.mark.parametrize("boundary", ["before_snapshot", "after_snapshot", "after_unlink", "before_definition",
+                                     "after_definition", "before_canonical"])
+@pytest.mark.parametrize("legacy", [False, True], ids=["snapshot", "historical"])
+def test_initialization_force_retry_boundaries(tmp_results, monkeypatch, boundary, legacy):
+    rd = ResultsDir(tmp_results)
+    first = ligands_df(seed=42, pdbqt="ATOM first coordinates")
+    second = ligands_df(seed=7, pdbqt="ATOM second coordinates")
+    rd.init_run({"seed": 42}, first)
+    old_ref = rd.run_manifest()["initial_ligands"]
+    old_bytes = Path(rd.ligands_file).read_bytes()
+    if legacy:
+        manifest = rd.run_manifest()
+        manifest.pop("initial_ligands")
+        wr._write_json(rd.manifest_file, manifest)
+    real_write, real_place, real_unlink = wr._write_json, wr.atomic_place, os.unlink
+
+    def fail():
+        raise RuntimeError("forced boundary")
+
+    def write(path, manifest):
+        if boundary == "before_definition" and manifest["params"] == {"seed": 7}:
+            fail()
+        real_write(path, manifest)
+        if boundary == "after_definition" and manifest["params"] == {"seed": 7}:
+            fail()
+
+    def place(src, dst):
+        if (boundary == "before_snapshot" and "initialization" in dst
+                or boundary == "before_canonical" and dst == rd.ligands_file):
+            fail()
+        return real_place(src, dst)
+
+    def unlink(path, *args, **kw):
+        if path == rd.ligands_file and boundary == "after_snapshot":
+            fail()
+        result = real_unlink(path, *args, **kw)
+        if path == rd.ligands_file and boundary == "after_unlink":
+            fail()
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(wr, "_write_json", write)
+        patch.setattr(wr, "atomic_place", place)
+        patch.setattr(os, "unlink", unlink)
+        with pytest.raises(RuntimeError, match="forced boundary"):
+            rd.init_run({"seed": 7}, second, force=True)
+    published = boundary in ("after_definition", "before_canonical")
+    elected = Path(rd.manifest_file).read_bytes()
+    manifest = rd.run_manifest()
+    assert manifest["params"] == {"seed": 7 if published else 42}
+    expected = (Path(tmp_results, manifest["initial_ligands"]["path"]).read_bytes()
+                if "initial_ligands" in manifest else old_bytes)
+    assert Path(tmp_results, old_ref["path"]).read_bytes() == old_bytes
+    if not published:
+        rd.recover_ligands()
+        assert Path(rd.ligands_file).read_bytes() == expected
+        assert Path(rd.manifest_file).read_bytes() == elected
+    # After publication retry the writer directly, without a prior recovery call masking the regression.
+    rd.init_run({"seed": 7}, second, force=True)
+    if published:
+        assert Path(rd.manifest_file).read_bytes() == elected
+        assert Path(rd.ligands_file).read_bytes() == expected
+    assert read_table(rd.ligands_file).pdbqt.tolist() == second.pdbqt.tolist()
+    initialization_files(tmp_results)
+    for candidate in Path(tmp_results, "initialization").iterdir():
+        assert pq.read_schema(candidate).equals(tables.LIGANDS)
+        assert wr.ligands_sha256(read_table(candidate)) in {wr.ligands_sha256(first), wr.ligands_sha256(second)}
+    assert not no_tmp_files(tmp_results)
+
+
+@pytest.mark.parametrize("damage", ["canonical", "snapshot", "historical"])
+def test_initialization_force_rejects_corruption(tmp_results, damage):
+    rd = ResultsDir(tmp_results)
+    first = ligands_df(pdbqt="ATOM elected")
+    rd.init_run({}, first)
+    ref = rd.run_manifest()["initial_ligands"]
+    if damage == "historical":
+        legacy = rd.run_manifest()
+        legacy.pop("initial_ligands")
+        wr._write_json(rd.manifest_file, legacy)
+    manifest = Path(rd.manifest_file).read_bytes()
+    path = Path(tmp_results, ref["path"]) if damage == "snapshot" else Path(rd.ligands_file)
+    tables.write_table(ligands_df(pdbqt="ATOM unrelated"), tables.LIGANDS, path)
+    damaged = path.read_bytes()
+    with pytest.raises(ValueError,
+                       match="differs from initial_ligands|invalid initial_ligands|differs from the historical run"):
+        rd.init_run({"seed": 7}, ligands_df(seed=7, pdbqt="ATOM new"), force=True)
+    assert path.read_bytes() == damaged
+    assert Path(rd.manifest_file).read_bytes() == manifest
+    assert len(list(Path(tmp_results, "initialization").iterdir())) == 1
+
+
+def test_initialization_force_legacy_retry_keeps_proteins(tmp_results, tmp_path, monkeypatch):
+    rd = ResultsDir(tmp_results)
+    first = ligands_df(seed=42, pdbqt="ATOM historical coordinates")
+    second = ligands_df(seed=7, pdbqt="ATOM new coordinates")
+    rd.init_run({"seed": 42}, first)
+    manifest = rd.run_manifest()
+    manifest.pop("initial_ligands")
+    wr._write_json(rd.manifest_file, manifest)
+    rd.commit("P1", stage(tmp_path, "P1")[0], {})
+    old_bytes = Path(rd.ligands_file).read_bytes()
+    real_unlink = os.unlink
+
+    def interrupted(path, *args, **kw):
+        result = real_unlink(path, *args, **kw)
+        if path == rd.ligands_file:
+            raise RuntimeError("historical canonical removed")
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "unlink", interrupted)
+        with pytest.raises(RuntimeError, match="historical canonical removed"):
+            rd.init_run({"seed": 7}, second, force=True)
+    assert rd.run_manifest()["params"] == {"seed": 42}
+    assert not Path(rd.ligands_file).exists()
+    ref = rd.run_manifest()["initial_ligands"]
+    assert Path(tmp_results, ref["path"]).read_bytes() == old_bytes
+    rd.init_run({"seed": 7}, second, force=True)
+    assert rd.done_proteins() == {"P1"} and rd.verify("P1") == []
+    initialization_files(tmp_results)
+
+
+def test_initialization_force_unlink_failure_preserves_definition(tmp_results, monkeypatch):
+    rd = ResultsDir(tmp_results)
+    rd.init_run({}, ligands_df(pdbqt="ATOM elected"))
+    manifest, canonical = Path(rd.manifest_file).read_bytes(), Path(rd.ligands_file).read_bytes()
+    real_unlink = os.unlink
+
+    def denied(path, *args, **kw):
+        if path == rd.ligands_file:
+            raise PermissionError(errno.EACCES, "canonical removal denied", path)
+        return real_unlink(path, *args, **kw)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "unlink", denied)
+        with pytest.raises(PermissionError, match="canonical removal denied"):
+            rd.init_run({"seed": 7}, ligands_df(seed=7, pdbqt="ATOM new"), force=True)
+    assert Path(rd.manifest_file).read_bytes() == manifest
+    assert Path(rd.ligands_file).read_bytes() == canonical
+    rd.init_run({"seed": 7}, ligands_df(seed=7, pdbqt="ATOM new"), force=True)
+    initialization_files(tmp_results)
+
+
 def test_init_run_writes_manifest_and_ligands(tmp_results):
     rd = ResultsDir(tmp_results)
     df = ligands_df()
@@ -377,14 +558,17 @@ def test_init_run_writes_manifest_and_ligands(tmp_results):
     assert back.ligand_id.tolist() == list(df.ligand_id) and back.ligand_idx.dtype == np.int32
     assert pq.read_schema(rd.ligands_file).equals(tables.LIGANDS)
     assert rd.done_proteins() == set() and not no_tmp_files(tmp_results)
+    initialization_files(tmp_results)
 
 
 def test_init_run_resume_and_conflicts(tmp_results):
     rd = ResultsDir(tmp_results)
     rd.init_run({"seed": 42, "box": [20, 20, 20]}, ligands_df())
     first = Path(rd.manifest_file).read_bytes()
+    candidates = set(Path(tmp_results, "initialization").iterdir())
     rd.init_run({"box": (20, 20, 20), "seed": 42}, ligands_df())  # same run, as JSON
     assert Path(rd.manifest_file).read_bytes() == first
+    assert set(Path(tmp_results, "initialization").iterdir()) == candidates
     with pytest.raises(ValueError, match="other params: num_modes, seed"):
         rd.init_run({"seed": 7, "box": [20, 20, 20], "num_modes": 9}, ligands_df())
     with pytest.raises(ValueError, match="other ligands"):
@@ -436,8 +620,174 @@ def test_init_run_stages_ligands_in_tmp_dir(tmp_results, tmp_path, monkeypatch):
     os.unlink(rd.ligands_file)
     rd.init_run({}, ligands_df(), tmp_dir=str(tmp_path / "run_tmp"))  # restores it
     rd.init_run({"seed": 7}, ligands_df(), force=True, tmp_dir=str(tmp_path / "run_tmp"))
-    assert len(staged) == 3 and all(Path(p).parent.parent == tmp_path / "run_tmp" for p in staged)
+    assert len(staged) == 2 and all(Path(p).parent.parent == tmp_path / "run_tmp" for p in staged)
     assert os.listdir(tmp_path / "run_tmp") == [] and os.listdir(tmp_path / "env_tmp") == []
+
+
+@pytest.mark.parametrize("boundary", ["before_snapshot", "before_election", "after_election"])
+def test_initialization_fault_boundaries(tmp_results, monkeypatch, boundary):
+    rd = ResultsDir(tmp_results)
+    first = ligands_df(pdbqt="ATOM first")
+    real_place, real_elect = wr.atomic_place, wr._create_exclusive
+
+    def fail(*args, **kw):
+        raise RuntimeError("injected boundary")
+
+    def place(src, dst):
+        if (boundary == "before_snapshot" and "initialization" in dst
+                or boundary == "after_election" and dst == rd.ligands_file):
+            fail()
+        return real_place(src, dst)
+
+    monkeypatch.setattr(wr, "atomic_place", place)
+    if boundary == "before_election":
+        monkeypatch.setattr(wr, "_create_exclusive", fail)
+    with pytest.raises(RuntimeError, match="injected boundary"):
+        rd.init_run({}, first)
+    assert bool(rd.run_manifest()) == (boundary == "after_election")
+    assert not Path(rd.ligands_file).exists()
+    assert not no_tmp_files(tmp_results)
+    monkeypatch.setattr(wr, "atomic_place", real_place)
+    monkeypatch.setattr(wr, "_create_exclusive", real_elect)
+    if boundary == "after_election":
+        rd.recover_ligands()
+        assert wr.ligands_sha256(read_table(rd.ligands_file)) == wr.ligands_sha256(first)
+    else:
+        second = ligands_df(pdbqt="ATOM second")
+        rd.init_run({}, second)
+        assert wr.ligands_sha256(read_table(rd.ligands_file)) == wr.ligands_sha256(second)
+    initialization_files(tmp_results)
+    for candidate in Path(tmp_results, "initialization").glob("*.parquet"):
+        assert pq.read_schema(candidate).equals(tables.LIGANDS)
+        expected = {wr.ligands_sha256(first)}
+        if boundary != "after_election":
+            expected.add(wr.ligands_sha256(second))
+        assert wr.ligands_sha256(read_table(candidate)) in expected
+
+
+@pytest.mark.parametrize("damage", ["missing", "bytes", "content", "schema", "absolute", "parent", "symlink",
+                                    "hash", "null", "missing_key", "rows"])
+def test_initialization_rejects_invalid_snapshot(tmp_results, tmp_path, damage):
+    rd = ResultsDir(tmp_results)
+    rd.init_run({}, ligands_df(pdbqt="ATOM first"))
+    manifest = rd.run_manifest()
+    ref = manifest["initial_ligands"]
+    path = Path(tmp_results, ref["path"])
+    if damage == "missing":
+        path.unlink()
+    elif damage == "bytes":
+        path.write_bytes(b"broken parquet")
+    elif damage == "content":
+        tables.write_table(ligands_df(pdbqt="ATOM other"), tables.LIGANDS, path)
+        ref["sha256"] = wr._file_sha256(path)
+    elif damage == "schema":
+        pq.write_table(pq.read_table(path).drop(["pdbqt"]), path)
+        ref["sha256"] = wr._file_sha256(path)
+    elif damage == "absolute":
+        ref["path"] = str(path)
+    elif damage == "parent":
+        ref["path"] = "initialization/../../outside.parquet"
+    elif damage == "symlink":
+        outside = tmp_path / "outside.parquet"
+        path.rename(outside)
+        path.symlink_to(outside)
+    elif damage == "hash":
+        ref["sha256"] = "not a SHA256"
+    elif damage == "null":
+        manifest["initial_ligands"] = None
+    elif damage == "missing_key":
+        ref.pop("path")
+    else:
+        manifest["n_ligands"] += 1
+    wr._write_json(rd.manifest_file, manifest)
+    before = Path(rd.manifest_file).read_bytes()
+    Path(rd.ligands_file).unlink()
+    with pytest.raises(ValueError, match="initial_ligands snapshot"):
+        rd.recover_ligands()
+    with pytest.raises(ValueError, match="initial_ligands snapshot"):
+        rd.init_run({}, ligands_df())
+    assert not Path(rd.ligands_file).exists()
+    assert Path(rd.manifest_file).read_bytes() == before
+
+
+def test_initialization_legacy_contract(tmp_results):
+    rd = ResultsDir(tmp_results)
+    first = ligands_df(pdbqt="ATOM original")
+    rd.init_run({}, first)
+    manifest = rd.run_manifest()
+    manifest.pop("initial_ligands")
+    wr._write_json(rd.manifest_file, manifest)
+    rd.init_run({}, first)
+    Path(rd.ligands_file).unlink()
+    with pytest.raises(ValueError, match="incomplete initialization.*new output directory"):
+        rd.init_run({}, ligands_df(pdbqt="ATOM different"))
+    assert not Path(rd.ligands_file).exists()
+    rd.init_run({}, first)
+    assert wr.ligands_sha256(read_table(rd.ligands_file)) == wr.ligands_sha256(first)
+    assert "initial_ligands" not in rd.run_manifest()
+
+
+@pytest.mark.parametrize("hard_links", [True, False])
+def test_initialization_multiple_recoverers(tmp_results, monkeypatch, hard_links):
+    rd = ResultsDir(tmp_results)
+    first = ligands_df(pdbqt="ATOM elected")
+    real_place = wr.atomic_place
+
+    def no_link(*args):
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    def stopped(src, dst):
+        if dst == rd.ligands_file:
+            raise RuntimeError("owner stopped")
+        return real_place(src, dst)
+
+    if not hard_links:
+        monkeypatch.setattr(os, "link", no_link)
+    monkeypatch.setattr(wr, "atomic_place", stopped)
+    with pytest.raises(RuntimeError, match="owner stopped"):
+        rd.init_run({}, first)
+    manifest = Path(rd.manifest_file).read_bytes()
+    barrier = threading.Barrier(5)
+    copies = []
+
+    def place(src, dst):
+        assert dst == rd.ligands_file
+        copies.append(Path(src).read_bytes())
+        barrier.wait(timeout=30)
+        return real_place(src, dst)
+
+    monkeypatch.setattr(wr, "atomic_place", place)
+    assert _race(5, lambda _: rd.recover_ligands()) == ["ok"] * 5
+    assert len(copies) == 5 and all(b == Path(rd.ligands_file).read_bytes() for b in copies)
+    assert Path(rd.manifest_file).read_bytes() == manifest
+    initialization_files(tmp_results)
+    assert not no_tmp_files(tmp_results)
+
+
+def test_initialization_equal_content_candidates_are_private(tmp_results):
+    rd = ResultsDir(tmp_results)
+    df = ligands_df(pdbqt="ATOM elected")
+    rd.init_run({}, df)
+    first = rd.run_manifest()["initial_ligands"]
+    rd.init_run({"seed": 7}, df, force=True)
+    second = rd.run_manifest()["initial_ligands"]
+    assert first["path"] != second["path"]
+    assert wr.ligands_sha256(read_table(Path(tmp_results, first["path"]))) == wr.ligands_sha256(df)
+    assert wr.ligands_sha256(read_table(Path(tmp_results, second["path"]))) == wr.ligands_sha256(df)
+    assert set(Path(tmp_results, "initialization").iterdir()) == {
+        Path(tmp_results, first["path"]), Path(tmp_results, second["path"])}
+    initialization_files(tmp_results)
+
+
+def test_initialization_malformed_manifest_has_bounded_wait(tmp_results, monkeypatch):
+    rd = ResultsDir(tmp_results)
+    Path(tmp_results).mkdir()
+    Path(rd.manifest_file).write_text('{"initial_ligands":')
+    ticks = iter((0, 11))
+    monkeypatch.setattr(wr.time, "monotonic", lambda: next(ticks))
+    with pytest.raises(json.JSONDecodeError):
+        rd.run_manifest()
+    assert list(Path(tmp_results).iterdir()) == [Path(rd.manifest_file)]
 
 
 def test_init_run_restores_missing_ligands(tmp_results):

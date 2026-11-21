@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Interrupted atlas initialization recovers the exact elected prepared ligands from a retained immutable snapshot,
+  preserving unseeded coordinates and safe selection among concurrent starters.
 - Repeated PoseBusters protein-load failures are bounded per protein independently of the number of poses.
   Healthy workers continue checking; unresolved poses get explicit load-related timeout or error results.
 - An Atlas instance can refresh its SAS or ChEMBL listing on a later call after a failed refresh, preserving usable

@@ -10,6 +10,8 @@ A run writes this folder:
 ```text
 results/
   MANIFEST.json                      the run: PocketVina version, settings, checksum of the ligand list
+  initialization/ligands-<digest>-<uuid>.parquet
+                                     retained immutable prepared-ligand snapshots
   manifest/<protein_id>.json         written last for each protein: the protein is done
   poses/<protein_id>.poses           highest-affinity pose per ligand as SDF, every engine output as PDBQT
   structures/<protein_id>.pdb.gz     the input structure, gzipped
@@ -61,6 +63,30 @@ the PVATLAS1 pose format.
 A folder holds one run. `MANIFEST.json` keeps the settings that change the results, such as box, seed, pockets and
 P2Rank model. Docking into the folder with other settings or ligands is refused. Use a new folder, or `--force` to
 replace the run. You can change the GPUs, the temp folder and the timeouts.
+
+New run manifests also contain `initial_ligands`, an object with a relative `path` under `initialization/` and
+the snapshot file's `sha256`. The snapshot is fully written, synced and verified before a process elects the run
+manifest. Its file checksum identifies the exact Parquet bytes; `ligands_sha256` remains the prepared content
+digest over every ligand column, including PDBQT coordinates. Neither the Parquet schemas nor PVATLAS1 change.
+
+If initialization stops after manifest election, resume restores `tables/ligands.parquet` from that snapshot
+before preparing ligands again. It preserves the elected coordinates even for unseeded or legacy preparation.
+Concurrent starters use the elected snapshot, including when they independently prepared different conformers.
+Missing, corrupt, mismatched or escaping snapshot references stop recovery with an error. A forced replacement also
+retains a recoverable definition if its process stops: resume restores the exact bytes elected by the manifest
+that was published. Historical runs gain a snapshot of their verified existing table before forced replacement.
+Recovery uses the explicitly configured temporary directory before environment or default scratch.
+
+Copy the **whole results folder**, including `initialization/`, when moving a run. The referenced snapshot is a
+required recovery artifact, not disposable temporary data. Concurrent attempts and `--force` can leave additional
+unreferenced snapshots. They are retained; there is no automatic garbage collection. A future collector must
+understand both manifest references and concurrent initialization. This adds no guarantee for concurrent
+`--force` or full power loss; do not use `--force` in shared array tasks.
+
+Historical manifests without `initial_ligands` still resume from their existing canonical table. If that table
+is missing, only a preparation with the exact original content digest can reconstruct it. Lost unseeded or
+legacy coordinates cannot be recreated honestly from names and SMILES alone: use a new output directory if the
+digest differs. Resume never adopts newly generated coordinates as the original run's ligands.
 
 ## Reading results
 

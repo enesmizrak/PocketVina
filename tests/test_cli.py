@@ -33,8 +33,10 @@ from test_pipeline import (
     POCKETS_CSV,
     _alive,
     cropped_receptor,
+    expected_files,
     make_database,
     make_inputs,
+    results_files,
     stub_predict_pockets,
     write_pockets,
 )
@@ -190,6 +192,7 @@ def test_dock_atlas(tmp_path, example_dir, fake_engine_env, stubs):
     assert f"results: {out}" in result.stdout
     assert "proteins: 1 docked, 0 done before, 0 failed (of 1)" in result.stdout
     assert "highest-affinity poses: 2" in result.stdout
+    assert results_files(out) == expected_files(out, {PID: "pdbqt"})
     params = manifest_params(out)
     assert {k: params[k] for k in ("output_format", "seed", "box_size", "thread", "num_modes", "energy_range",
                                    "top_pockets", "ligands_per_call", "pocket_source")} == dict(

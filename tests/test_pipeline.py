@@ -7,6 +7,7 @@ OpenBabel needs 15-25 s to turn each example protein into a receptor PDBQT, so m
 atoms (``cropped_receptor``); ``test_receptor_pdbqt_matches_obabel_cli`` checks the conversion itself.
 """
 import dataclasses
+import errno
 import gzip
 import hashlib
 import json
@@ -22,9 +23,11 @@ import tempfile
 import threading
 import time
 import types
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pandas as pd
+import pyarrow.parquet as pq
 import pytest
 from rdkit import Chem
 
@@ -36,8 +39,9 @@ from pocketvina.io.posefile import Reader
 from pocketvina.io.results import Results
 from pocketvina.io.tables import read_table
 from pocketvina.io.writer import ResultsDir
-from pocketvina.ligands import find_obabel
+from pocketvina.ligands import LigandRecord, find_obabel
 from pocketvina.main import P2RankConfig, P2RankProcessor, PocketConfig, check_ligand_names, read_protein_list
+from test_io_writer import initialization_files, ligands_df
 
 TESTS_DIR = Path(__file__).resolve().parent
 DATA_DIR = TESTS_DIR / "data"
@@ -153,9 +157,9 @@ def results_files(root) -> set:
     return {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
 
 
-def expected_files(proteins: dict) -> set:
+def expected_files(root, proteins: dict) -> set:
     """``proteins``: {protein_id: structure kind ("pdb", "pdbqt")}."""
-    files = {"MANIFEST.json", "tables/ligands.parquet"}
+    files = {"MANIFEST.json", "tables/ligands.parquet"} | initialization_files(root)
     for pid, ext in proteins.items():
         files |= {f.format(p=pid, ext=ext) for f in PER_PROTEIN}
     return files
@@ -241,7 +245,7 @@ def test_atlas_end_to_end_example_proteins(tmp_path, example_dir, fake_engine_en
     path = pipeline.run_atlas(PocketVinaGPU(atlas_config(plist, smiles, out, tmp_base)))
 
     assert path == str(out)
-    assert results_files(out) == expected_files({p: "pdb" for p in EXAMPLE_PROTEINS})
+    assert results_files(out) == expected_files(out, {p: "pdb" for p in EXAMPLE_PROTEINS})
     assert os.listdir(tmp_base) == []  # the run's temp folder is gone
     assert [os.path.basename(s) for s in stubs] == ["1fbl.pdb", "2W83.pdb"]
 
@@ -279,7 +283,7 @@ def test_atlas_keeps_p2rank_sas_points(tmp_path, example_dir, fake_engine_env, s
     plist, smiles = make_inputs(tmp_path, example_dir, ligands=("molecule1",))
     out = tmp_path / "results"
     pipeline.run_atlas(PocketVinaGPU(atlas_config(plist, smiles, out, tmp_path / "tmp")))
-    assert results_files(out) == (expected_files({p: "pdb" for p in EXAMPLE_PROTEINS})
+    assert results_files(out) == (expected_files(out, {p: "pdb" for p in EXAMPLE_PROTEINS})
                                   | {f"sas/{p}.json.gz" for p in EXAMPLE_PROTEINS})
     assert os.listdir(tmp_path / "tmp") == []
     points = sas.read_points(POINTS_FILE)
@@ -339,7 +343,7 @@ def test_atlas_file_count_per_protein(tmp_path, example_dir, fake_engine_env, st
 
     files = results_files(out)
     pids = {"1fbl": "pdb", "AF-Q96LA5-F1-model_v4": "pdbqt"}
-    assert files == expected_files(pids)
+    assert files == expected_files(out, pids)
     for pid in pids:
         assert len([f for f in files if Path(f).name.startswith(pid + ".")]) == 8
 
@@ -472,7 +476,7 @@ def test_atlas_pocket_slots(tmp_path, example_dir, fake_engine_env, stubs, monke
     assert len(read_table(out / "tables" / "pairs" / f"{pid}.parquet")) == 0
     with Reader(out / "poses" / f"{pid}.poses") as r:
         assert (r.N, r.K) == (2, 2)
-    assert results_files(out) == expected_files({pid: "pdbqt"})
+    assert results_files(out) == expected_files(out, {pid: "pdbqt"})
 
 
 def test_htvs_mode_docks_five_pockets(tmp_path, example_dir, fake_engine_env, stubs):
@@ -483,7 +487,7 @@ def test_htvs_mode_docks_five_pockets(tmp_path, example_dir, fake_engine_env, st
     assert pv.execute_docking() == str(out)
     assert len(fake_engine_env.calls()) == 5
     assert json.loads((out / "MANIFEST.json").read_text())["params"]["top_pockets"] == 5
-    assert results_files(out) == expected_files({"AF-Q96LA5-F1-model_v4": "pdbqt"})  # no log files, no proteins/
+    assert results_files(out) == expected_files(out, {"AF-Q96LA5-F1-model_v4": "pdbqt"})  # no log files, no proteins/
 
 
 def test_input_identity_content_and_pocket_source(tmp_path):
@@ -801,6 +805,205 @@ def test_atlas_rerun_skips_done_proteins_and_ligand_preparation(tmp_path, exampl
     assert os.listdir(tmp_path / "tmp") == []
 
 
+def test_initialization_pipeline_recovers_exact_preparation(tmp_path, monkeypatch):
+    from pocketvina.io import writer
+
+    rd = ResultsDir(tmp_path / "results")
+    cfg = types.SimpleNamespace(tmp_dir=str(tmp_path / "tmp"), ligand_prep="standard", seed=None)
+    rows = [("molecule2", "C"), ("molecule5", "CC"), ("molecule10", "CCC")]
+    first = ligands_df(pdbqt="ATOM first coordinates")
+    second = ligands_df(pdbqt="ATOM second coordinates")
+    real_place = writer.atomic_place
+
+    def interrupted(src, dst):
+        if dst == rd.ligands_file:
+            raise RuntimeError("initialization interrupted")
+        return real_place(src, dst)
+
+    monkeypatch.setattr(writer, "atomic_place", interrupted)
+    with pytest.raises(RuntimeError, match="initialization interrupted"):
+        rd.init_run({}, first, tmp_dir=cfg.tmp_dir)
+    monkeypatch.setattr(writer, "atomic_place", real_place)
+    monkeypatch.setattr(pipeline, "prepare_ligands", lambda *a, **kw: [
+        LigandRecord(**row) for row in second.to_dict("records")])
+    monkeypatch.setattr(pipeline, "STORED_LIGANDS_WAIT_S", 0)
+    actual = pipeline._ligand_table(rd, rows, {}, cfg, False)
+    assert actual.equals(tables.to_arrow(first, tables.LIGANDS))
+
+
+@pytest.mark.parametrize("lookup", ["initial", "fallback"])
+@pytest.mark.parametrize("explicit", [True, False], ids=["configured", "environment"])
+def test_initialization_pipeline_recovery_scratch(tmp_path, monkeypatch, lookup, explicit):
+    from pocketvina.io import writer
+
+    rd = ResultsDir(tmp_path / "results")
+    first = ligands_df(pdbqt="ATOM elected")
+    rd.init_run({}, first)
+    expected = Path(rd.ligands_file).read_bytes()
+    Path(rd.ligands_file).unlink()
+    configured, environment = tmp_path / "configured-tmp", tmp_path / "environment-tmp"
+    configured.mkdir()
+    environment.mkdir()
+    monkeypatch.setenv("POCKETVINA_TMPDIR", str(environment))
+    cfg = types.SimpleNamespace(tmp_dir=str(configured) if explicit else None, ligand_prep="standard", seed=None)
+    sources, lookups = [], []
+    real_place, real_stored, real_init = writer.atomic_place, pipeline._stored_ligands, rd.init_run
+
+    def place(src, dst):
+        assert dst == rd.ligands_file
+        sources.append(Path(src))
+        if explicit and Path(src).parent.parent != configured:
+            raise OSError(errno.ENOSPC, "wrong scratch is full")
+        return real_place(src, dst)
+
+    def stored(*args, **kw):
+        lookups.append(kw.get("wait", 0))
+        if lookup == "fallback" and len(lookups) == 1:
+            return None  # another starter has not elected its definition yet
+        return real_stored(*args, **kw)
+
+    def init(*args, **kw):
+        if lookup == "fallback" and len(lookups) == 1:
+            raise ValueError("another process elected different conformers")
+        return real_init(*args, **kw)
+
+    def prepare(*args, **kw):
+        assert lookup == "fallback", "recovery prepared new conformers"
+        return [LigandRecord(**row) for row in ligands_df(pdbqt="ATOM other").to_dict("records")]
+
+    monkeypatch.setattr(writer, "atomic_place", place)
+    monkeypatch.setattr(pipeline, "_stored_ligands", stored)
+    monkeypatch.setattr(rd, "init_run", init)
+    monkeypatch.setattr(pipeline, "prepare_ligands", prepare)
+    rows = list(zip(first.ligand_id, first.smiles_input))
+    actual = pipeline._ligand_table(rd, rows, {}, cfg, False)
+    assert actual.equals(tables.to_arrow(first, tables.LIGANDS))
+    assert Path(rd.ligands_file).read_bytes() == expected
+    assert lookups == ([0] if lookup == "initial" else [0, pipeline.STORED_LIGANDS_WAIT_S])
+    assert len(sources) == 1 and sources[0].parent.parent == (configured if explicit else environment)
+    assert list(configured.iterdir()) == list(environment.iterdir()) == []
+
+
+@pytest.mark.parametrize("hard_links", [True, False])
+@pytest.mark.parametrize("stop_owner", [True, False])
+def test_initialization_concurrent_distinct_conformers(tmp_path, monkeypatch, hard_links, stop_owner):
+    from pocketvina.io import writer
+
+    rd = ResultsDir(tmp_path / "results")
+    cfg = types.SimpleNamespace(tmp_dir=str(tmp_path / "tmp"), ligand_prep="standard", seed=None)
+    rows = [("molecule2", "C"), ("molecule5", "CC"), ("molecule10", "CCC")]
+    barrier, lock = threading.Barrier(6), threading.Lock()
+    preparations, winners = [], []
+    real_elect = writer._create_exclusive
+
+    def prepare(*args, **kw):
+        with lock:
+            index = len(preparations)
+            table = ligands_df(pdbqt=f"ATOM coordinates {index}")
+            preparations.append(table)
+        barrier.wait(timeout=30)
+        return [LigandRecord(**row) for row in table.to_dict("records")]
+
+    def elect(path, manifest):
+        elected = real_elect(path, manifest)
+        if elected:
+            winners.append(manifest)
+            if stop_owner:
+                raise RuntimeError("owner stopped after election")
+        return elected
+
+    def no_link(*args):
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    def no_wait(*args):
+        pytest.fail("snapshot recovery waited for an absent owner")
+
+    monkeypatch.setattr(pipeline, "prepare_ligands", prepare)
+    monkeypatch.setattr(writer, "_create_exclusive", elect)
+    if hard_links:
+        monkeypatch.setattr(pipeline.time, "sleep", no_wait)
+    if not hard_links:
+        monkeypatch.setattr(os, "link", no_link)
+
+    def start(_):
+        try:
+            return pipeline._ligand_table(rd, rows, {}, cfg, False)
+        except RuntimeError as e:
+            assert str(e) == "owner stopped after election"
+            return None
+
+    with ThreadPoolExecutor(6) as pool:
+        results = list(pool.map(start, range(6)))
+    assert len(winners) == 1 and len(preparations) == 6
+    assert len({writer.ligands_sha256(t) for t in preparations}) == 6
+    assert sum(t is None for t in results) == int(stop_owner)
+    winner = rd.run_manifest()
+    for table in results:
+        if table is not None:
+            assert writer.ligands_sha256(table) == winner["ligands_sha256"]
+    assert rd.run_manifest() == winners[0]
+    elected = initialization_files(rd.path)
+    candidates = set()
+    for path in Path(rd.path, "initialization").iterdir():
+        assert path.suffix == ".parquet" and pq.read_schema(path).equals(tables.LIGANDS)
+        digest = writer.ligands_sha256(read_table(path))
+        assert digest in {writer.ligands_sha256(t) for t in preparations}
+        assert path.name.startswith("ligands-" + digest + "-")
+        candidates.add(path.relative_to(rd.path).as_posix())
+    assert elected <= candidates
+    assert results_files(rd.path) == {"MANIFEST.json", "tables/ligands.parquet"} | candidates
+    assert not list(Path(cfg.tmp_dir).iterdir())
+
+
+def test_initialization_recovery_forbids_preparation_and_wait(tmp_path, monkeypatch):
+    rd = ResultsDir(tmp_path / "results")
+    first = ligands_df(pdbqt="ATOM elected")
+    rd.init_run({}, first)
+    before = Path(rd.manifest_file).read_bytes()
+    canonical = Path(rd.ligands_file).read_bytes()
+    Path(rd.ligands_file).unlink()
+
+    def forbidden(*args, **kw):
+        pytest.fail("recovery prepared or waited")
+
+    monkeypatch.setattr(pipeline, "prepare_ligands", forbidden)
+    monkeypatch.setattr(pipeline.time, "sleep", forbidden)
+    rows = list(zip(first.ligand_id, first.smiles_input))
+    cfg = types.SimpleNamespace(tmp_dir=str(tmp_path / "tmp"))
+    table = pipeline._ligand_table(rd, rows, {}, cfg, False)
+    assert table.equals(tables.to_arrow(first, tables.LIGANDS))
+    assert Path(rd.ligands_file).read_bytes() == canonical
+    assert Path(rd.manifest_file).read_bytes() == before
+    assert pipeline._stored_ligands(rd, [("changed", "C")], {}) is None
+    assert pipeline._stored_ligands(rd, rows, {"seed": 7}) is None
+
+
+@pytest.mark.parametrize("change", ["names", "smiles", "params"])
+def test_initialization_rejects_changed_raw_inputs(tmp_path, monkeypatch, change):
+    rd = ResultsDir(tmp_path / "results")
+    first = ligands_df(pdbqt="ATOM elected")
+    rd.init_run({}, first)
+    manifest = Path(rd.manifest_file).read_bytes()
+    Path(rd.ligands_file).unlink()
+    second = first.copy()
+    params = {}
+    if change == "names":
+        second.loc[0, "ligand_id"] = "changed"
+    elif change == "smiles":
+        second.loc[0, "smiles_input"] = "N"
+    else:
+        params = {"seed": 7}
+    rows = list(zip(second.ligand_id, second.smiles_input))
+    cfg = types.SimpleNamespace(tmp_dir=str(tmp_path / "tmp"), ligand_prep="standard", seed=None)
+    monkeypatch.setattr(pipeline, "prepare_ligands", lambda *a, **kw: [
+        LigandRecord(**row) for row in second.to_dict("records")])
+    monkeypatch.setattr(pipeline, "STORED_LIGANDS_WAIT_S", 0)
+    with pytest.raises(ValueError, match="other params" if change == "params" else "other ligands"):
+        pipeline._ligand_table(rd, rows, params, cfg, False)
+    assert Path(rd.manifest_file).read_bytes() == manifest
+    assert read_table(rd.ligands_file).pdbqt.tolist() == first.pdbqt.tolist()
+
+
 def test_atlas_resume_keeps_stored_ligands(tmp_path, example_dir, fake_engine_env, stubs, monkeypatch):
     """When a new preparation differs from the stored ligands (an unseeded preparation, or another process that
     started the same run first), the run docks the stored ones."""
@@ -882,7 +1085,35 @@ def kill_on(n):
     if count[0] == n:
         os.kill(os.getpid(), signal.SIGKILL)
 
-if event == "after_commit":
+if event == "initialization":
+    from pocketvina.io import writer
+    place = writer.atomic_place
+    def killing_place(src, dst):
+        if dst == rd.ligands_file:
+            kill_on(at)
+        return place(src, dst)
+    writer.atomic_place = killing_place
+elif event.startswith("force_"):
+    from pocketvina.io import writer
+    place, unlink, write = writer.atomic_place, os.unlink, writer._write_json
+    def killing_place(src, dst):
+        if (event == "force_before_snapshot" and "initialization" in dst
+                or event == "force_before_canonical" and dst == rd.ligands_file):
+            kill_on(at)
+        return place(src, dst)
+    def killing_unlink(path, *a, **kw):
+        if path == rd.ligands_file and event == "force_after_snapshot":
+            kill_on(at)
+        result = unlink(path, *a, **kw)
+        if path == rd.ligands_file and event == "force_after_unlink":
+            kill_on(at)
+        return result
+    def killing_write(path, manifest):
+        write(path, manifest)
+        if event == "force_after_definition":
+            kill_on(at)
+    writer.atomic_place, os.unlink, writer._write_json = killing_place, killing_unlink, killing_write
+elif event == "after_commit":
     commit = ResultsDir.commit
     def killing_commit(self, *a, **kw):
         manifest = commit(self, *a, **kw)
@@ -905,19 +1136,21 @@ else:
         kill_on(at)
         return run_engine(*a, **kw)
     pipeline.run_engine = killing_run_engine
-pipeline.run_atlas(PocketVinaGPU(PocketVinaConfig(**args["config"])))
+pipeline.run_atlas(PocketVinaGPU(PocketVinaConfig(**args["config"])), force=args.get("force", False))
 """
 
 
-def run_and_kill(tmp_path, config: dict, kill, hold_after=2):
+def run_and_kill(tmp_path, config: dict, kill, hold_after=2, force=False):
     """Run ``config`` in a driver process that SIGKILLs itself at ``kill`` = ("after_commit", n): right after the
     n-th commit (engine calls after the first ``hold_after`` wait for it, so that none of the protein prepared ahead
-    runs), or ("engine_call", n): when the n-th engine call starts (once a protein is committed)."""
+    runs), ("engine_call", n): when the n-th engine call starts (once a protein is committed), or
+    ("initialization", 1): after election, before canonical ligand placement.
+    With force=True, force_* events interrupt snapshot publication, canonical removal or definition publication."""
     driver = tmp_path / "driver.py"
     driver.write_text(DRIVER.format(tests_dir=str(TESTS_DIR)))
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [str(REPO_ROOT), os.environ.get("PYTHONPATH")])))
     proc = subprocess.run([sys.executable, str(driver), json.dumps(dict(config=config, kill=kill,
-                                                                         hold_after=hold_after))],
+                                                                         hold_after=hold_after, force=force))],
                           env=env, cwd=str(tmp_path), capture_output=True, text=True, timeout=600)
     assert proc.returncode == -signal.SIGKILL, proc.stdout[-3000:] + proc.stderr[-3000:]
 
@@ -946,7 +1179,7 @@ def test_atlas_resume_after_crash(tmp_path, example_dir, fake_engine_env, stubs,
     assert len(new_calls) == 2 and calls_for(new_calls, second) == new_calls  # the first protein is not redone
     assert rd.done_proteins() == {first, second}
     assert {f: (out / f).read_bytes() for f in results_files(out) if first in f} == first_files
-    assert results_files(out) == expected_files({p: "pdb" for p in EXAMPLE_PROTEINS})
+    assert results_files(out) == expected_files(out, {p: "pdb" for p in EXAMPLE_PROTEINS})
 
     # same results as a run that was not interrupted
     ref = tmp_path / "reference"
@@ -958,6 +1191,83 @@ def test_atlas_resume_after_crash(tmp_path, example_dir, fake_engine_env, stubs,
                                           read_table(ref / "tables" / table / f"{p}.parquet"))
         runs = [read_table(d / "tables" / "pocket_runs" / f"{p}.parquet").drop(columns="runtime_s") for d in (out, ref)]
         pd.testing.assert_frame_equal(*runs)
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGKILL"), reason="needs SIGKILL")
+def test_initialization_resume_after_owner_killed(tmp_path, example_dir, fake_engine_env, stubs, monkeypatch):
+    plist, smiles = make_inputs(tmp_path, example_dir, proteins=[FIXTURE_RECEPTOR], ligands=("molecule1",))
+    out = tmp_path / "results"
+    config = dict(protein_paths=str(plist), smiles_file=str(smiles), output_dir=str(out), output_format="atlas",
+                  tmp_dir=str(tmp_path / "tmp"), top_pockets=1, seed=None)
+    run_and_kill(tmp_path, config, ("initialization", 1))
+    rd = ResultsDir(out)
+    manifest = Path(rd.manifest_file).read_bytes()
+    ref = rd.run_manifest()["initial_ligands"]
+    snapshot = (out / ref["path"]).read_bytes()
+    assert not Path(rd.ligands_file).exists() and not rd.done_proteins()
+
+    def forbidden(*args, **kw):
+        pytest.fail("resume prepared new coordinates after killing the owner")
+
+    monkeypatch.setattr(pipeline, "prepare_ligands", forbidden)
+    pipeline.run_atlas(PocketVinaConfig(**config))
+    assert Path(rd.ligands_file).read_bytes() == snapshot
+    assert Path(rd.manifest_file).read_bytes() == manifest
+    assert results_files(out) == expected_files(out, {FIXTURE_RECEPTOR.stem: "pdbqt"})
+    assert rd.verify(FIXTURE_RECEPTOR.stem) == []
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGKILL"), reason="needs SIGKILL")
+@pytest.mark.parametrize("boundary", ["before_snapshot", "after_snapshot", "after_unlink", "after_definition",
+                                     "before_canonical"])
+def test_initialization_force_pipeline_retry_after_kill(tmp_path, example_dir, fake_engine_env, stubs,
+                                                       monkeypatch, boundary):
+    from pocketvina.io.writer import ligands_sha256
+
+    plist, smiles = make_inputs(tmp_path, example_dir, proteins=[FIXTURE_RECEPTOR], ligands=("molecule1",))
+    out = tmp_path / "results"
+    config = dict(protein_paths=str(plist), smiles_file=str(smiles), output_dir=str(out), output_format="atlas",
+                  tmp_dir=str(tmp_path / "tmp"), top_pockets=1, seed=42)
+    pipeline.run_atlas(PocketVinaConfig(**config))
+    rd = ResultsDir(out)
+    old = rd.run_manifest()
+    old_bytes = Path(rd.ligands_file).read_bytes()
+    protein_files = {f: (out / f).read_bytes() for f in results_files(out) if FIXTURE_RECEPTOR.stem in f}
+    calls = len(fake_engine_env.calls())
+    config["seed"] = 7
+    run_and_kill(tmp_path, config, ("force_" + boundary, 1), force=True)
+    published = boundary in ("after_definition", "before_canonical")
+    manifest = rd.run_manifest()
+    assert manifest["params"]["seed"] == (7 if published else 42)
+    elected = Path(rd.manifest_file).read_bytes()
+    expected = (out / manifest["initial_ligands"]["path"]).read_bytes()
+    assert (out / old["initial_ligands"]["path"]).read_bytes() == old_bytes
+    rd.recover_ligands(tmp_dir=config["tmp_dir"])
+    assert Path(rd.ligands_file).read_bytes() == expected
+    assert Path(rd.manifest_file).read_bytes() == elected
+
+    def forbidden(*args, **kw):
+        pytest.fail("forced retry prepared new conformers despite an elected snapshot")
+
+    if published:
+        # Exercise the pipeline's pre-init recovery as well as the writer's identical forced retry.
+        Path(rd.ligands_file).unlink()
+        monkeypatch.setattr(pipeline, "prepare_ligands", forbidden)
+    pipeline.run_atlas(PocketVinaConfig(**config), force=True)
+    if published:
+        assert Path(rd.manifest_file).read_bytes() == elected
+        assert Path(rd.ligands_file).read_bytes() == expected
+    assert rd.run_manifest()["params"]["seed"] == 7
+    assert len(fake_engine_env.calls()) == calls
+    assert {f: (out / f).read_bytes() for f in protein_files} == protein_files
+    initialization_files(out)
+    candidates = set()
+    for path in (out / "initialization").iterdir():
+        assert pq.read_schema(path).equals(tables.LIGANDS)
+        assert path.name.startswith("ligands-" + ligands_sha256(read_table(path)) + "-")
+        candidates.add(path.relative_to(out).as_posix())
+    assert results_files(out) == expected_files(out, {FIXTURE_RECEPTOR.stem: "pdbqt"}) | candidates
+    # SIGKILL can leave the killed process's private scratch folder; successful retries clean their own.
 
 
 SIGTERM_DRIVER = """\
@@ -1060,7 +1370,7 @@ def test_atlas_failed_engine_leaves_proteins_for_a_rerun(tmp_path, example_dir, 
     assert set(pv.failed_proteins) == set(EXAMPLE_PROTEINS)
     assert "clGetPlatformIDs failed" in pv.failed_proteins["1fbl"]
     assert ResultsDir(out).done_proteins() == set()
-    assert results_files(out) == {"MANIFEST.json", "tables/ligands.parquet"}
+    assert results_files(out) == expected_files(out, {})
 
     monkeypatch.setenv("POCKETVINA_ENGINE", str(fake_engine_env))
     pv = PocketVinaGPU(atlas_config(plist, smiles, out, tmp_path / "tmp"))
@@ -1223,7 +1533,7 @@ def test_run_atlas_takes_any_config_but_only_an_atlas_pocketvina(tmp_path, examp
                               tmp_dir=str(tmp_path / "tmp"), top_pockets=1)
     assert pipeline.run_atlas(config) == str(out)
     assert config.output_format == "files"  # the caller's config is not changed
-    assert results_files(out) == expected_files({"AF-Q96LA5-F1-model_v4": "pdbqt"})
+    assert results_files(out) == expected_files(out, {"AF-Q96LA5-F1-model_v4": "pdbqt"})
     assert len(fake_engine_env.calls()) == 1
     with pytest.raises(ValueError, match="num_modes"):
         pipeline.run_atlas(dataclasses.replace(config, num_modes=200))
@@ -1325,7 +1635,7 @@ def test_atlas_database_workflow(tmp_path, example_dir, fake_engine_env):
     prot = read_table(out / "tables" / "proteins" / f"{pid}.parquet").iloc[0]
     assert (prot.uniprot, prot.n_pockets, prot.n_pockets_docked) == ("Q96LA5", 2, 2)
     assert json.loads((out / "MANIFEST.json").read_text())["params"]["pocket_source"] == "database"
-    assert results_files(out) == expected_files({pid: "pdbqt"})
+    assert results_files(out) == expected_files(out, {pid: "pdbqt"})
 
 
 # --- ligands per engine call, ligand order, engine timeout ---------------------------------------------------------
@@ -2019,7 +2329,7 @@ def test_real_p2rank_and_receptor_end_to_end(tmp_path, example_dir, fake_engine_
     ligands = read_table(out / "tables" / "ligands.parquet")
     n_pockets = len(read_table(out / "tables" / "pockets" / "1fbl.parquet"))
     check_protein(out, "1fbl", ligands, n_pockets=n_pockets, K=1, docked=(1,))
-    assert results_files(out) == expected_files({"1fbl": "pdb"}) | {"sas/1fbl.json.gz"}
+    assert results_files(out) == expected_files(out, {"1fbl": "pdb"}) | {"sas/1fbl.json.gz"}
     assert os.listdir(tmp_path / "tmp") == []
     with Results(out) as res:
         points = res.sas("1fbl")
