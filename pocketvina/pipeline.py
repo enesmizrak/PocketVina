@@ -18,6 +18,7 @@ stopped run resumes where it was, and several processes may write different prot
 import builtins
 import dataclasses
 import glob
+import gzip
 import hashlib
 import itertools
 import json
@@ -166,6 +167,65 @@ def _pockets_in_dir(pockets_dir: Optional[str], path: str, pid: str) -> Optional
         if os.path.isfile(csv_path):
             return csv_path
     return None
+
+
+def _input_sha256(path: str, component: str, *, decompress: bool = False) -> str:
+    """Hash input bytes in chunks, ignoring gzip headers for compressed structures."""
+    digest = hashlib.sha256()
+    try:
+        with (gzip.open if decompress else open)(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except (OSError, EOFError, zlib.error) as e:
+        raise ValueError(f"cannot read {component} input: {e}") from e
+    return digest.hexdigest()
+
+
+def _input_identity(prot: ProteinInput) -> dict:
+    """Versioned source identity, independent of file locations and prepared receptor bytes."""
+    return dict(version=1,
+                structure_sha256=_input_sha256(prot.source_path, "structure",
+                                               decompress=prot.source_path.lower().endswith(".gz")),
+                pocket_source="supplied" if prot.pockets_csv is not None else "predicted",
+                pockets_sha256=(_input_sha256(prot.pockets_csv, "supplied pockets")
+                                if prot.pockets_csv is not None else None))
+
+
+def _identity_changes(saved: dict, current: dict) -> str:
+    return ", ".join(key for key in ("structure_sha256", "pocket_source", "pockets_sha256")
+                     if saved[key] != current[key])
+
+
+def _check_resume_identity(prot: ProteinInput, manifest_path: str) -> bool:
+    """Validate a completed protein before reuse; False means legacy, with no stored identity field."""
+    try:
+        with open(manifest_path) as stream:
+            summary = json.load(stream)["summary"]
+        if not isinstance(summary, dict):
+            raise ValueError("malformed summary")
+        if "input_identity" not in summary:
+            return False
+        saved = summary["input_identity"]
+        if not isinstance(saved, dict):
+            raise ValueError("malformed input_identity")
+        if type(saved.get("version")) is not int or saved["version"] != 1:
+            raise ValueError("unsupported or malformed input_identity version")
+        for key in ("structure_sha256", "pockets_sha256"):
+            value = saved.get(key)
+            if key == "pockets_sha256" and saved.get("pocket_source") == "predicted":
+                if key not in saved or value is not None:
+                    raise ValueError("malformed input_identity pockets_sha256")
+            elif not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ValueError(f"malformed input_identity {key}")
+        if saved.get("pocket_source") not in ("supplied", "predicted"):
+            raise ValueError("malformed input_identity pocket_source")
+        changes = _identity_changes(saved, _input_identity(prot))
+        if changes:
+            raise ValueError(f"changed {changes}")
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise RunAborted(f"{prot.protein_id}: cannot reuse completed results: {e}. "
+                         "Use a new output directory for changed inputs.") from e
+    return True
 
 
 def _pdb_from_pdbqt(text: str) -> str:
@@ -1027,6 +1087,7 @@ class _ProteinJob:
     docked: List[Pocket]        # the pockets docked
     notes: List[str]
     receptor_sha256: bytes
+    input_identity: dict
     structure: Tuple[str, str]  # (path in results, staged temp path)
     calls: List[_Call]
     t0: float
@@ -1058,6 +1119,7 @@ def _prepare_protein(pv: PocketVinaGPU, n: int, prot: ProteinInput, lig: _Ligand
     t0 = time.monotonic()
     if not os.path.isfile(prot.source_path):
         raise FileNotFoundError(f"structure not found: {prot.source_path}")
+    input_identity = _input_identity(prot)
     pockets_csv = prot.pockets_csv or predict_pockets(prot.source_path, os.path.join(work, "p2rank"),
                                                       cfg.p2rank_config, while_running=while_running)
     p2rank_s = 0.0 if prot.pockets_csv else time.monotonic() - t0
@@ -1088,6 +1150,9 @@ def _prepare_protein(pv: PocketVinaGPU, n: int, prot: ProteinInput, lig: _Ligand
     # pockets of a CSV (given, or the database's) come without points
     sas_file = None if prot.pockets_csv else _stage_sas(pockets_csv, pid, [p.rank for p in docked],
                                                         os.path.join(work, "stage"), cfg.gzip_level)
+    changes = _identity_changes(input_identity, _input_identity(prot))
+    if changes:
+        raise ValueError(f"inputs changed during preparation: {changes}")
     meta = dict(params=params, source=os.path.basename(prot.source_path), structure_file=structure[0],
                 receptor_sha256=receptor_sha256.hex(), ligands_sha256=ligands_sha256)
     writer = ProteinWriter(pid, lig.n, [p.rank for p in docked], K, work, meta, uniprot=prot.uniprot,
@@ -1101,7 +1166,8 @@ def _prepare_protein(pv: PocketVinaGPU, n: int, prot: ProteinInput, lig: _Ligand
         raise
     calls = [_Call(pid, receptor, pocket, batch_no, lig_dir, stems)
              for pocket in docked for batch_no, (lig_dir, stems) in enumerate(batches, 1)]
-    return _ProteinJob(n, prot, work, writer, pockets, docked, notes, receptor_sha256, structure, calls, t0,
+    return _ProteinJob(n, prot, work, writer, pockets, docked, notes, receptor_sha256, input_identity,
+                       structure, calls, t0,
                        pending=len(calls), p2rank_s=p2rank_s, receptor_s=receptor_s, t_docking=time.monotonic(),
                        sas=sas_file)
 
@@ -1138,6 +1204,7 @@ def _finish_protein(pv: PocketVinaGPU, rd: ResultsDir, job: _ProteinJob, lig: _L
         tables.write_table(rows, schema, path)
         staged[rel] = path
     summary = dict(job.writer.summary, status=status, n_pockets=len(job.pockets), n_pockets_docked=len(job.docked),
+                   input_identity=job.input_identity,
                    engine_runs=job.n_runs, engine_runs_failed=job.n_failed,
                    runtime_s=round(time.monotonic() - job.t0, 3), p2rank_s=round(job.p2rank_s, 3),
                    receptor_s=round(job.receptor_s, 3), docking_s=round(time.monotonic() - job.t_docking, 3),
@@ -1165,6 +1232,7 @@ class _Docking:
         self.jobs: Dict[str, _ProteinJob] = {}
         self.total = 0
         self.n_docked = self.n_done_before = 0
+        self._legacy_identity_warned = False
         self.memory: Optional[gpu.MemorySampler] = None  # started with the slots
 
     def run(self, proteins: Sequence[ProteinInput]) -> None:
@@ -1196,6 +1264,12 @@ class _Docking:
         for n, prot in todo:
             pid = prot.protein_id
             if self.rd.is_done(pid):
+                verified = _check_resume_identity(prot, self.rd.protein_manifest_file(pid))
+                if not verified and not self._legacy_identity_warned:
+                    logger.warning("%s: legacy completed results have no input_identity; their input identity "
+                                   "could not be verified. Legacy proteins are skipped without verification "
+                                   "(this warning is shown once per run).", pid)
+                    self._legacy_identity_warned = True
                 self.n_done_before += 1
                 logger.info("%s (%d/%d): already in %s, skipped", pid, n, self.total, self.rd.path)
                 if self.buster is not None:  # skipped there if its PoseBusters results are in place

@@ -218,6 +218,25 @@ def test_dock_atlas(tmp_path, example_dir, fake_engine_env, stubs):
     assert "1 done before" in result.stdout and manifest_params(out)["seed"] == 8
 
 
+def test_dock_input_identity_rejects_changed_structure(tmp_path, example_dir, fake_engine_env, stubs):
+    source = tmp_path / FIXTURE_RECEPTOR.name
+    shutil.copyfile(FIXTURE_RECEPTOR, source)
+    plist, smiles = inputs(tmp_path, example_dir, proteins=[source], ligands=LIGANDS[:1])
+    out = tmp_path / "results"
+    args = ("dock", "--proteins", plist, "--ligands", smiles, "--out", out, "--top-pockets", 1,
+            "--tmp-dir", tmp_path / "tmp")
+    ok(invoke(*args))
+    n_calls = len(fake_engine_env.calls())
+    manifest = out / "manifest" / f"{source.stem}.json"
+    before = manifest.read_bytes()
+    source.write_bytes(source.read_bytes() + b"REMARK changed\n")
+    result = invoke(*args, "--force")
+    assert result.exit_code != 0
+    assert source.stem in result.output and "structure_sha256" in result.output
+    assert "new output directory" in result.output and "--force" not in result.output
+    assert len(fake_engine_env.calls()) == n_calls and manifest.read_bytes() == before
+
+
 def test_dock_ligands_per_call_zero_docks_all_ligands_of_a_pocket_in_one_call(tmp_path, example_dir,
                                                                                fake_engine_env, stubs):
     """--ligands-per-call 0 = all ligands of a pocket in one engine call (main.ligand_chunk_size), as in Python."""

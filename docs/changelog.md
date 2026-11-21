@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Resuming atlas runs verifies stored structure and supplied pocket CSV fingerprints before reusing completed
+  proteins. Changed inputs require a new output directory; legacy results without fingerprints warn once per run.
 - Existing `Results` instances refresh cached poses after a protein's results are replaced.
 - Docker images include the viewer assets needed for HTML and notebook 3D views.
 - The web app renders upload names, result values, and viewer errors as inert data while preserving 3D previews.

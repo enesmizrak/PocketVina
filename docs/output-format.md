@@ -24,7 +24,39 @@ results/
     posebusters/<protein_id>.parquet  after PoseBusters checks
 ```
 
-A protein is done when its `manifest/<protein_id>.json` exists. A new run skips the done proteins.
+A protein is done when its `manifest/<protein_id>.json` exists. A resumed run checks its input identity before
+skipping it. Newly computed proteins, including those with no pockets, store this additive field in the manifest:
+
+```json
+{
+  "summary": {
+    "input_identity": {
+      "version": 1,
+      "structure_sha256": "<64 lowercase hexadecimal characters>",
+      "pocket_source": "predicted",
+      "pockets_sha256": null
+    }
+  }
+}
+```
+
+`structure_sha256` hashes the input structure bytes, decompressing gzipped inputs first. Changing gzip metadata
+alone does not change the identity. For supplied predictions, `pocket_source` is `"supplied"` and
+`pockets_sha256` hashes the exact CSV bytes; even formatting changes count. The identity contains no paths, so
+moving identical input files preserves it. Predicted pockets use the structure identity together with the existing
+run-level P2Rank settings; resume validation does not run P2Rank again. This does not fingerprint the P2Rank
+executable or model files. The separate `receptor_sha256` still identifies the prepared receptor given to the engine.
+
+A changed structure, supplied CSV or pocket source stops reuse of known results. Missing or unreadable inputs,
+malformed identities and unsupported identity versions also stop the run. Use a **new output directory** for changed
+inputs; `--force` does not bypass this check or redock a retained completed protein. The existing committed results
+are preserved. Inputs are also checked again after preparation and staging; a protein whose inputs changed during
+preparation is left uncommitted for retry.
+
+Older or imported protein manifests without the `input_identity` field remain readable and are skipped with one
+warning per invocation that their input identity could not be verified. No current fingerprints are added to those
+legacy manifests. A present but invalid field is an error. This extension changes neither the Parquet schemas nor
+the PVATLAS1 pose format.
 
 A folder holds one run. `MANIFEST.json` keeps the settings that change the results, such as box, seed, pockets and
 P2Rank model. Docking into the folder with other settings or ligands is refused. Use a new folder, or `--force` to

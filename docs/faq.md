@@ -16,6 +16,17 @@ results folder. This covers `Results`, `show()`, `bust()` and the commands `info
 ### How do I resume a run that stopped?
 
 Run the same command or code again. Proteins that are done are skipped, and all others are docked.
+For newly computed results, PocketVina verifies the structure and supplied pocket CSV contents before skipping.
+Moving identical inputs or changing only gzip metadata is harmless. Older or imported results without stored input
+identity are still skipped, with one warning per invocation that their identity could not be verified.
+
+### I changed a receptor or its supplied pocket centres
+
+Use a new output directory (`--out`) to compute results for the changed inputs. Reusing a completed protein with a
+known different structure, pocket CSV or pocket source stops the run and preserves its committed results.
+`--force` does not bypass this identity check: with the same ligand list, completed proteins are retained even when
+`--force` accepts changed settings. Missing inputs, malformed stored identities and unsupported identity versions
+also stop reuse; restore the original readable inputs or use a new output directory.
 
 ### The run stops with "... holds another run"
 
