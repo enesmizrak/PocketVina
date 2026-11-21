@@ -71,3 +71,6 @@ docs/dev/
 
 # the small test fixtures (one AlphaFold model, the example ligands): the tests need them, also on GitHub CI
 !tests/data/**
+
+# local improvement plans and their evidence; kept out of the project
+/plans/
