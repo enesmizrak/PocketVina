@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- An Atlas instance can refresh its SAS or ChEMBL listing on a later call after a failed refresh, preserving usable
+  cached data and allowing recovery without clearing the cache or creating another instance.
 - Resuming atlas runs verifies stored structure and supplied pocket CSV fingerprints before reusing completed
   proteins. Changed inputs require a new output directory; legacy results without fingerprints warn once per run.
 - Existing `Results` instances refresh cached poses after a protein's results are replaced.
