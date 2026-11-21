@@ -18,6 +18,7 @@ from pocketvina.io import posefile
 from pocketvina.io.importer import _natural_key, import_legacy
 from pocketvina.io.tables import read_table
 from pocketvina.io.writer import ResultsDir
+from test_io_writer import initialization_files
 
 PID = "AF-Q96LA5-F1-model_v4"
 NAMES = ("molecule2", "molecule5", "molecule10")
@@ -80,13 +81,14 @@ def imported_no_smiles(real_run, tmp_path_factory):
 def test_layout(imported, tmp_path_factory):
     files = sorted(digests(imported))
     assert files == sorted([
-        "MANIFEST.json", f"manifest/{PID}.json", f"poses/{PID}.poses", f"structures/{PID}.pdbqt.gz",
+        *initialization_files(imported), "MANIFEST.json", f"manifest/{PID}.json", f"poses/{PID}.poses",
+        f"structures/{PID}.pdbqt.gz",
         "tables/ligands.parquet", *(f"tables/{t}/{PID}.parquet"
                                     for t in ("proteins", "pockets", "pocket_runs", "modes", "pairs"))])
     rd = ResultsDir(imported)
     assert rd.done_proteins() == {PID} and rd.verify(PID) == []
     manifest = rd.protein_manifest(PID)
-    run_level = ("MANIFEST.json", f"manifest/{PID}.json", "tables/ligands.parquet")
+    run_level = ("MANIFEST.json", f"manifest/{PID}.json", "tables/ligands.parquet", *initialization_files(imported))
     assert sorted(manifest["files"]) == [f for f in files if f not in run_level]
     assert manifest["summary"]["source"] == "import_legacy" and manifest["summary"]["n_outputs"] == 4
     assert rd.run_manifest()["params"] == {"source": "import_legacy", "ligand_prep": "legacy"}

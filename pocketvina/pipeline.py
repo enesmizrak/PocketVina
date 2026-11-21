@@ -399,11 +399,13 @@ def run_params(pv: PocketVinaGPU, n_ligands: int) -> dict:
 
 # --- ligands -------------------------------------------------------------------------------------------------------
 
-def _stored_ligands(rd: ResultsDir, rows, params: dict, wait: float = 0) -> Optional[pa.Table]:
+def _stored_ligands(rd: ResultsDir, rows, params: dict, wait: float = 0,
+                    tmp_dir: Optional[str] = None) -> Optional[pa.Table]:
     """The run's ``ligands.parquet`` if the run has these params and was made from the same (name, SMILES) rows."""
     manifest = rd.run_manifest()
     if manifest is None or manifest.get("params") != json.loads(json.dumps(params, sort_keys=True)):
         return None
+    rd.recover_ligands(manifest, tmp_dir=tmp_dir)
     deadline = time.monotonic() + wait
     while not os.path.isfile(rd.ligands_file):
         if time.monotonic() >= deadline:
@@ -423,7 +425,7 @@ def _stored_ligands(rd: ResultsDir, rows, params: dict, wait: float = 0) -> Opti
 def _ligand_table(rd: ResultsDir, rows, params: dict, cfg: PocketVinaConfig, force: bool) -> pa.Table:
     """Ligands of the run: read back when resuming (no new preparation, and unseeded preparations stay the same),
     else prepared now; registers the run with ``ResultsDir.init_run``."""
-    stored = _stored_ligands(rd, rows, params)
+    stored = _stored_ligands(rd, rows, params, tmp_dir=cfg.tmp_dir)
     if stored is not None:
         rd.init_run(params, stored, force=force, tmp_dir=cfg.tmp_dir)
         return stored
@@ -438,7 +440,8 @@ def _ligand_table(rd: ResultsDir, rows, params: dict, cfg: PocketVinaConfig, for
         rd.init_run(params, table, force=force, tmp_dir=cfg.tmp_dir)
     except ValueError:
         # another process may have started the same run a moment earlier (with an unseeded preparation)
-        stored = None if force else _stored_ligands(rd, rows, params, wait=STORED_LIGANDS_WAIT_S)
+        stored = None if force else _stored_ligands(rd, rows, params, wait=STORED_LIGANDS_WAIT_S,
+                                                   tmp_dir=cfg.tmp_dir)
         if stored is None:
             raise
         logger.info("using the ligands of the run started by another process in %s", rd.path)

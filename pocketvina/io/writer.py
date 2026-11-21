@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from typing import Callable, Dict, NamedTuple, Optional, Tuple
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # resolve_tmp_dir lives in the (pyarrow-free) engine module, so the "files" format can use it; part of this API too
 from ..engine import TMP_ENV_VARS, resolve_tmp_dir  # noqa: F401
@@ -282,7 +284,8 @@ class ResultsDir:
         unless the ligand list (``ligand_id`` and ``smiles_input`` by ``ligand_idx``) changed: their tables and pose
         files index the old list, so they are no longer done and a run docks them again.
         Several processes may call this at once: one of them writes ``MANIFEST.json``, the others compare with it.
-        ``ligands.parquet`` is staged in ``resolve_tmp_dir(tmp_dir)``.
+        A private immutable initialization snapshot is durable before the manifest references it. The elected
+        snapshot supplies ``ligands.parquet``; all staging uses ``resolve_tmp_dir(tmp_dir)``.
         """
         if not isinstance(params, Mapping):
             raise TypeError(f"params must be a dict, not {type(params).__name__}")
@@ -302,19 +305,33 @@ class ResultsDir:
         os.makedirs(self.path, exist_ok=True)
         existing = self.run_manifest()
         if existing is None:
+            manifest["initial_ligands"] = self._snapshot_ligands(table, digest, tmp_dir)
             if _create_exclusive(self.manifest_file, manifest):
-                self._place_ligands(table, tmp_dir)
+                self.recover_ligands(manifest, tmp_dir)
                 logger.info("new run in %s (%d ligands)", self.path, table.num_rows)
                 return
             existing = self.run_manifest()
             if existing is None:
                 raise RuntimeError(f"{self.manifest_file} disappeared while starting the run")
+        self.recover_ligands(existing, tmp_dir)
         problems = _run_differences(existing, params, digest)
         if problems:
             if not force:
+                if "initial_ligands" not in existing and not os.path.isfile(self.ligands_file):
+                    problems.append("incomplete initialization: exact prepared ligands are unavailable; "
+                                    "use a new output directory")
                 raise ValueError(f"{self.path} holds another run ({'; '.join(problems)}): use a new results "
                                  "directory, or force=True to replace the run definition")
             logger.warning("replacing the run definition of %s (%s)", self.path, "; ".join(problems))
+            if "initial_ligands" not in existing and os.path.isfile(self.ligands_file):
+                # Preserve historical bytes too, so an interruption before the new definition is published
+                # can recover the old list and retain its committed proteins on an identical forced retry.
+                old = tables.to_arrow(pq.read_table(self.ligands_file, partitioning=None), tables.LIGANDS)
+                if old.num_rows != existing["n_ligands"] or ligands_sha256(old) != existing["ligands_sha256"]:
+                    raise ValueError(f"{self.ligands_file}: differs from the historical run manifest")
+                existing = dict(existing, initial_ligands=self._snapshot_ligands(
+                    old, existing["ligands_sha256"], tmp_dir, source=self.ligands_file))
+                _write_json(self.manifest_file, existing)
             stale = sorted(self.done_proteins()) if not self._lists_ligands(table) else []
             if stale:
                 # before the new ligands: a crash in between must not leave these done against the new list
@@ -322,12 +339,97 @@ class ResultsDir:
                                "again: %s", len(stale), ", ".join(stale[:10]) + (" ..." if len(stale) > 10 else ""))
                 for pid in stale:
                     _unlink(self.protein_manifest_file(pid))
-            self._place_ligands(table, tmp_dir)
+            manifest["initial_ligands"] = self._snapshot_ligands(table, digest, tmp_dir)
+            # Before publication the old snapshot can restore the old definition; afterwards the new
+            # snapshot restores the new one. Never leave old canonical bytes beside a new definition.
+            try:
+                os.unlink(self.ligands_file)
+            except FileNotFoundError:
+                pass
             _write_json(self.manifest_file, manifest)
+            self.recover_ligands(manifest, tmp_dir)
             return
         if not os.path.isfile(self.ligands_file):
             self._place_ligands(table, tmp_dir)  # a process stopped between MANIFEST.json and ligands.parquet
         logger.info("resuming the run in %s (%d proteins done)", self.path, len(self.done_proteins()))
+
+    def _snapshot_ligands(self, table, digest, tmp_dir, source=None):
+        """Publish one private candidate; even equal content never shares an overwriteable destination."""
+        rel = f"initialization/ligands-{digest}-{uuid.uuid4().hex}.parquet"
+        path = os.path.join(self.path, rel)
+        root = os.path.realpath(self.path)
+        if os.path.commonpath([root, os.path.realpath(path)]) != root:
+            raise ValueError("initial_ligands snapshot path escapes the results directory")
+        tmp = resolve_tmp_dir(tmp_dir)
+        try:
+            local = os.path.join(tmp, "ligands.parquet")
+            if source is None:
+                tables.write_table(table, tables.LIGANDS, local)
+            else:
+                shutil.copyfile(source, local)
+            with open(local, "rb") as f:
+                os.fsync(f.fileno())
+            atomic_place(local, path)
+            reference = dict(path=rel, sha256=_file_sha256(path))
+            self._initial_ligands(dict(initial_ligands=reference, ligands_sha256=digest,
+                                       n_ligands=table.num_rows))
+            return reference
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _initial_ligands(self, manifest):
+        """Validate the elected reference, schema, file bytes and prepared content before using it."""
+        reference = manifest["initial_ligands"]
+        try:
+            rel, checksum = reference["path"], reference["sha256"]
+            norm = _check_relpath(rel)
+            if norm != rel or not norm.startswith("initialization/"):
+                raise ValueError("snapshot path must be relative inside initialization/")
+            path = os.path.join(self.path, *norm.split("/"))
+            root, resolved = os.path.realpath(self.path), os.path.realpath(path)
+            if os.path.commonpath([root, resolved]) != root:
+                raise ValueError("snapshot path escapes the results directory")
+            if not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum):
+                raise ValueError("invalid file SHA256")
+            if _file_sha256(path) != checksum:
+                raise ValueError("file SHA256 mismatch")
+            table = pq.read_table(path, partitioning=None)
+            if not table.schema.equals(tables.LIGANDS):
+                raise ValueError("ligand schema mismatch")
+            table = tables.to_arrow(table, tables.LIGANDS)
+            if table.num_rows != manifest["n_ligands"] or ligands_sha256(table) != manifest["ligands_sha256"]:
+                raise ValueError("prepared ligand content mismatch")
+            return path, table
+        except (KeyError, TypeError, OSError, ValueError, pa.ArrowException) as e:
+            raise ValueError(f"invalid initial_ligands snapshot in {self.manifest_file}: {e}") from e
+
+    def recover_ligands(self, manifest=None, tmp_dir=None):
+        """Validate an elected snapshot and atomically copy its exact bytes to a missing canonical table.
+
+        Return its table, or None for historical manifests without a snapshot. Concurrent recoverers copy the
+        same immutable bytes; a forced redefinition removes the previous canonical table before publication.
+        """
+        manifest = self.run_manifest() if manifest is None else manifest
+        if manifest is None or "initial_ligands" not in manifest:
+            return None
+        path, table = self._initial_ligands(manifest)
+        if os.path.isfile(self.ligands_file):
+            if _file_sha256(self.ligands_file) != manifest["initial_ligands"]["sha256"]:
+                raise ValueError(f"{self.ligands_file}: differs from initial_ligands snapshot")
+            return table
+        tmp = resolve_tmp_dir(tmp_dir)
+        try:
+            local = os.path.join(tmp, "ligands.parquet")
+            with open(path, "rb") as src, open(local, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+                dst.flush()
+                os.fsync(dst.fileno())
+            if _file_sha256(local) != manifest["initial_ligands"]["sha256"]:
+                raise ValueError("initial_ligands snapshot changed during recovery")
+            atomic_place(local, self.ligands_file)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        return table
 
     def _lists_ligands(self, table) -> bool:
         """True if ``ligands.parquet`` holds the ligands of ``table``: same ``ligand_id``, ``smiles_input`` per

@@ -106,6 +106,15 @@ the run that the other tasks write into.
 To resume, submit the same job or array again. Proteins that are done are skipped. A cancelled job cleans up after
 itself, so `#SBATCH --requeue` is safe.
 
+New runs retain an immutable prepared-ligand snapshot under `initialization/`, referenced by `MANIFEST.json`.
+If the initializing task dies after electing the manifest, another task restores the exact winning table before
+preparing any ligands. Tasks that prepared different unseeded conformers still use the elected coordinates.
+Keep the entire results folder when copying it, including these recovery artifacts. Unreferenced snapshots from
+concurrent attempts are also retained; no garbage collector runs. Historical runs without a snapshot and without
+`tables/ligands.parquet` can resume only if preparation reproduces the exact original digest; otherwise start in
+a new output directory. Corrupt or missing referenced snapshots are errors. This does not add concurrent-force
+or full power-loss guarantees.
+
 To see how far a run is:
 
 ```bash
