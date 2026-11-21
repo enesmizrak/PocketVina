@@ -57,6 +57,7 @@ DEFAULT_TIMEOUTS = (30, 300)
 MAX_DEFAULT_WORKERS = 16  # each worker holds RDKit, PoseBusters and the protein (~200 MB)
 MAX_CHECKS = 31  # bits of the int32 masks (the sign bit is not used)
 PROTEIN_LOAD_TIMEOUT = 600  # seconds a worker may take to load a protein
+_PROTEIN_LOAD_FAILURES_PER_WORKER = 2  # shared failed-load allowance for each protein/check
 START_METHOD = None  # multiprocessing start method of the workers; None: "fork" on Linux, else "spawn"
 # Parquet schema metadata of a posebusters part
 META_CHECKS = "pocketvina.pb_checks"
@@ -396,7 +397,7 @@ class _Worker:
 
 
 class _Pool:
-    """Worker processes that check one pose at a time with a per-pose timeout."""
+    """One-pose-at-a-time workers with independent pose timeouts and a shared protein-load failure allowance."""
 
     def __init__(self, cfg: dict, n_workers: int, timeouts: Sequence[Optional[float]], tmp_dir: str):
         # the workers share the CPUs this process may use
@@ -419,7 +420,13 @@ class _Pool:
         w.kill()
         self.workers.remove(w)
 
-    def _idle(self) -> Optional[_Worker]:
+    def _idle(self, key: int, allow_load: bool) -> Optional[_Worker]:
+        # A healthy loaded worker can drain the queue even after the load allowance is exhausted.
+        for w in self.workers:
+            if w.task is None and w.protein == key and w.loaded:
+                return w
+        if not allow_load:
+            return None
         for w in self.workers:
             if w.task is None:
                 return w
@@ -434,7 +441,8 @@ class _Pool:
 
     def _receive(self, w: _Worker, key: int) -> Tuple[Optional[dict], bool]:
         """Read what worker ``w`` (busy, readable) sent: (result of its pose, False), (None, False) if the pose is
-        still being checked (the protein is loaded now), or (an "error" result, True) if the worker died."""
+        still being checked (the protein is loaded now), or (an "error" result, True) if the worker died or
+        rejected the protein. A rejected loader must be discarded, including its queued pose reply."""
         while True:
             try:
                 msg = w.conn.recv()
@@ -444,6 +452,8 @@ class _Pool:
             if msg[0] == "protein":
                 if msg[1] != key:
                     raise RuntimeError(f"PoseBusters worker loaded protein {msg[1]}, expected {key}")
+                if msg[2] is not None:
+                    return dict(status="error", error=msg[2]), True
                 now = time.monotonic()
                 timeout = self._timeout(w.task[1])
                 w.loaded, w.started = True, now
@@ -475,9 +485,22 @@ class _Pool:
         spent = [0.0] * n
         left = n
         send_failures = 0
+        load_limit = _PROTEIN_LOAD_FAILURES_PER_WORKER * self.n_workers
+        load_failures = 0
+        load_error = None  # any explicit failure takes precedence over deadline-only exhaustion
+
+        def failed_load(error: Optional[str] = None):
+            nonlocal load_failures, load_error
+            load_failures += 1
+            if error is not None and load_error is None:
+                load_error = error
+
         while left:
             while queue:
-                w = self._idle()
+                # Every in-flight load reserves a possible failure. Success releases the reservation;
+                # failures consume it for the rest of this check, regardless of pose retries or successes.
+                loading = sum(w.task is not None and not w.loaded for w in self.workers)
+                w = self._idle(key, load_failures + loading < load_limit)
                 if w is None:
                     break
                 i, attempt = queue.popleft()
@@ -494,6 +517,8 @@ class _Pool:
                     w.protein, w.loaded = key, False
                 ok = ok and w.send(("pose", i, payload))
                 if not ok:
+                    if not w.loaded:
+                        failed_load("the PoseBusters worker process died while sending the protein or pose")
                     self._discard(w)
                     queue.appendleft((i, attempt))
                     send_failures += 1
@@ -509,6 +534,13 @@ class _Pool:
                     w.deadline = None if timeout is None else now + timeout
             busy = [w for w in self.workers if w.task is not None]
             if not busy:
+                if queue and load_failures >= load_limit:
+                    reason = load_error or f"all {load_limit} protein loads exceeded {PROTEIN_LOAD_TIMEOUT:g} s"
+                    for i, _ in queue:
+                        results[i] = dict(status="error" if load_error else "timeout",
+                                          error=f"PoseBusters protein load budget exhausted: {reason}",
+                                          runtime_s=spent[i])
+                    break
                 continue
             deadlines = [w.deadline for w in busy if w.deadline is not None]
             wait_s = max(0.0, min(deadlines) - time.monotonic()) if deadlines else None
@@ -518,6 +550,12 @@ class _Pool:
                 if result is None:
                     continue
                 i = w.task[0]
+                if died and not w.loaded:
+                    spent[i] += time.monotonic() - w.started
+                    failed_load(result["error"])
+                    queue.append(w.task)  # loading failures do not spend a per-pose check attempt
+                    self._discard(w)
+                    continue
                 if died:
                     result["runtime_s"] = spent[i] + time.monotonic() - w.started
                     logger.warning("%s: pose %d: %s", label, i, result["error"])
@@ -533,6 +571,11 @@ class _Pool:
                 i, attempt = w.task
                 spent[i] += now - w.started
                 what = "loading the protein" if not w.loaded else "checking the pose"
+                if not w.loaded:
+                    failed_load()
+                    queue.append((i, attempt))
+                    self._discard(w)
+                    continue
                 self._discard(w)
                 if attempt + 1 < len(self.timeouts):
                     logger.info("%s: pose %d: %s took longer than %g s, trying again with %g s", label, i, what,
@@ -832,7 +875,10 @@ def bust_results(results_dir, *, select: str = "best", top_k: int = 1, config="d
     (a failure is a "convert_failed" row).
     ``config``: a PoseBusters config name ("dock", "dock_fast", ...) or dict. ``workers``: worker processes (None:
     ``default_workers()``). ``timeouts``: seconds per pose for each attempt; a pose still running after the last one
-    is a "timeout" row (None: no limit). ``proteins``: protein ids (None: every committed protein).
+    is a "timeout" row (None: no per-pose limit). Protein loading has a separate 600-second deadline per worker
+    and a shared allowance of two failed loads per configured worker for each protein check. Healthy workers
+    continue; if none can continue after exhaustion, unresolved poses get load-specific "timeout" or "error" rows.
+    ``proteins``: protein ids (None: every committed protein).
     A protein that already has a table is skipped unless ``overwrite`` (or it was docked again since). Temp files go
     to ``io.writer.resolve_tmp_dir(tmp_dir)`` and are removed at the end.
 
