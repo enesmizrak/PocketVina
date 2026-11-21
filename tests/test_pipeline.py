@@ -486,6 +486,303 @@ def test_htvs_mode_docks_five_pockets(tmp_path, example_dir, fake_engine_env, st
     assert results_files(out) == expected_files({"AF-Q96LA5-F1-model_v4": "pdbqt"})  # no log files, no proteins/
 
 
+def test_input_identity_content_and_pocket_source(tmp_path):
+    source = tmp_path / "protein.pdb"
+    source.write_bytes(b"structure\n")
+    moved = tmp_path / "moved" / source.name
+    moved.parent.mkdir()
+    shutil.copyfile(source, moved)
+    csv = tmp_path / "pockets.csv"
+    csv.write_bytes(b"centers\n")
+    prot = pipeline.ProteinInput("protein", str(source), None, None)
+    predicted = pipeline._input_identity(prot)
+    assert predicted == dict(version=1, structure_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+                             pocket_source="predicted", pockets_sha256=None)
+    assert pipeline._input_identity(prot._replace(source_path=str(moved))) == predicted
+    source.write_bytes(b"changed structure\n")
+    assert pipeline._input_identity(prot)["structure_sha256"] != predicted["structure_sha256"]
+    supplied = prot._replace(pockets_csv=str(csv))
+    identity = pipeline._input_identity(supplied)
+    assert identity["pocket_source"] == "supplied"
+    assert identity["pockets_sha256"] == hashlib.sha256(csv.read_bytes()).hexdigest()
+    csv.write_bytes(b"changed centers\n")
+    assert pipeline._input_identity(supplied)["pockets_sha256"] != identity["pockets_sha256"]
+
+
+def test_input_identity_gzip_metadata_only(tmp_path):
+    prot = pipeline.ProteinInput("protein", str(tmp_path / "protein.pdb.gz"), None, None)
+    identities = []
+    compressed = []
+    for stamp, name in ((1, "original.pdb"), (2, "other.pdb")):
+        with open(prot.source_path, "wb") as raw:
+            with gzip.GzipFile(filename=name, fileobj=raw, mode="wb", mtime=stamp) as stream:
+                stream.write(b"structure\n")
+        compressed.append(Path(prot.source_path).read_bytes())
+        identities.append(pipeline._input_identity(prot))
+    assert compressed[0] != compressed[1]
+    assert identities[0] == identities[1]
+    assert identities[0]["structure_sha256"] == hashlib.sha256(b"structure\n").hexdigest()
+
+
+@pytest.mark.parametrize("supplied", [False, True])
+@pytest.mark.parametrize("n_pockets", [0, 1])
+def test_input_identity_committed(tmp_path, example_dir, fake_engine_env, stubs, monkeypatch, supplied,
+                                  n_pockets):
+    source = tmp_path / FIXTURE_RECEPTOR.name
+    shutil.copyfile(FIXTURE_RECEPTOR, source)
+    plist, smiles = make_inputs(tmp_path, example_dir, ligands=("molecule1",), proteins=[source])
+    pockets = tmp_path / "pockets"
+    pockets.mkdir()
+    csv = pockets / f"{source.stem}.csv"
+    write_pockets(csv, n_pockets)
+    monkeypatch.setattr(pipeline, "predict_pockets", stub_predict_pockets(n_pockets))
+    out = tmp_path / "results"
+    cfg = atlas_config(plist, smiles, out, tmp_path / "tmp", top_pockets=1,
+                       pockets_dir=str(pockets) if supplied else None)
+    pipeline.run_atlas(cfg)
+    summary = json.loads((out / "manifest" / f"{source.stem}.json").read_text())["summary"]
+    assert summary["input_identity"] == dict(
+        version=1, structure_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+        pocket_source="supplied" if supplied else "predicted",
+        pockets_sha256=hashlib.sha256(csv.read_bytes()).hexdigest() if supplied else None)
+    assert summary["status"] == ("ok" if n_pockets else "no_pockets")
+
+
+@pytest.mark.parametrize("component", ["structure", "pockets"])
+def test_input_identity_changes_during_preparation(tmp_path, example_dir, fake_engine_env, stubs, monkeypatch,
+                                                  component):
+    source = tmp_path / FIXTURE_RECEPTOR.name
+    shutil.copyfile(FIXTURE_RECEPTOR, source)
+    plist, smiles = make_inputs(tmp_path, example_dir, ligands=("molecule1",), proteins=[source])
+    pockets = tmp_path / "pockets"
+    pockets.mkdir()
+    csv = pockets / f"{source.stem}.csv"
+    write_pockets(csv, 1)
+    stage = pipeline._stage_structure
+
+    def changing_stage(*args, **kw):
+        result = stage(*args, **kw)
+        path = source if component == "structure" else csv
+        path.write_bytes(path.read_bytes() + b"\n")
+        return result
+
+    monkeypatch.setattr(pipeline, "_stage_structure", changing_stage)
+    out = tmp_path / "results"
+    pv = PocketVinaGPU(atlas_config(plist, smiles, out, tmp_path / "tmp", pockets_dir=str(pockets)))
+    pipeline.run_atlas(pv)
+    assert "inputs changed during preparation" in pv.failed_proteins[source.stem]
+    assert component in pv.failed_proteins[source.stem]
+    assert not ResultsDir(out).is_done(source.stem)
+    assert not fake_engine_env.calls()
+    assert os.listdir(tmp_path / "tmp") == []
+
+
+@pytest.mark.parametrize("moved", [False, True])
+def test_input_identity_rejects_changed_structure(tmp_path, example_dir, fake_engine_env, stubs, moved):
+    source = tmp_path / FIXTURE_RECEPTOR.name
+    shutil.copyfile(FIXTURE_RECEPTOR, source)
+    plist, smiles = make_inputs(tmp_path, example_dir, ligands=("molecule1",), proteins=[source])
+    out = tmp_path / "results"
+    cfg = atlas_config(plist, smiles, out, tmp_path / "tmp", top_pockets=1)
+    pipeline.run_atlas(cfg)
+    before = {f: (out / f).read_bytes() for f in results_files(out)}
+    calls = len(fake_engine_env.calls())
+    if moved:
+        replacement = tmp_path / "other" / source.name
+        replacement.parent.mkdir()
+        shutil.copyfile(source, replacement)
+        source = replacement
+        plist.write_text(f"{source}\n")
+    source.write_bytes(source.read_bytes() + b"REMARK changed input\n")
+    with pytest.raises(pipeline.RunAborted, match="structure"):
+        pipeline.run_atlas(cfg)
+    assert len(fake_engine_env.calls()) == calls
+    assert {f: (out / f).read_bytes() for f in results_files(out)} == before
+
+
+@pytest.fixture
+def input_identity_run(tmp_path, example_dir, fake_engine_env, stubs):
+    source = tmp_path / FIXTURE_RECEPTOR.name
+    shutil.copyfile(FIXTURE_RECEPTOR, source)
+    plist, smiles = make_inputs(tmp_path, example_dir, ligands=("molecule1",), proteins=[source])
+    pockets = tmp_path / "pockets"
+    pockets.mkdir()
+    csv = pockets / f"{source.stem}.csv"
+    write_pockets(csv, 1)
+    cfg = atlas_config(plist, smiles, tmp_path / "results", tmp_path / "tmp", top_pockets=1,
+                       pockets_dir=str(pockets))
+    pipeline.run_atlas(cfg)
+    return cfg, source, csv
+
+
+@pytest.mark.parametrize("change,component", [
+    ("structure", "structure_sha256"), ("pockets", "pockets_sha256"),
+    ("missing_structure", "structure"), ("missing_pockets", "pocket_source"),
+    ("predicted", "pocket_source"),
+])
+@pytest.mark.parametrize("force", [False, True])
+def test_input_identity_resume_rejects_changes(input_identity_run, fake_engine_env, stubs, change, component,
+                                              force):
+    cfg, source, csv = input_identity_run
+    out = Path(cfg.output_dir)
+    if change in ("structure", "pockets"):
+        path = source if change == "structure" else csv
+        path.write_bytes(path.read_bytes() + b"\n")
+    elif change == "missing_structure":
+        source.unlink()
+    elif change == "missing_pockets":
+        csv.unlink()
+    else:
+        # Keep the run-level pockets directory setting, but select predicted pockets for this protein.
+        csv.rename(csv.with_suffix(".unused"))
+    before = {f: (out / f).read_bytes() for f in results_files(out)}
+    n_calls, n_predictions = len(fake_engine_env.calls()), len(stubs)
+    with pytest.raises(pipeline.RunAborted) as error:
+        pipeline.run_atlas(cfg, force=force)
+    message = str(error.value)
+    assert source.stem in message and component in message and "new output directory" in message
+    assert "--force" not in message
+    assert len(fake_engine_env.calls()) == n_calls and len(stubs) == n_predictions
+    assert {f: (out / f).read_bytes() for f in results_files(out)} == before
+    assert os.listdir(cfg.tmp_dir) == []
+
+
+def test_input_identity_predicted_to_supplied(tmp_path, example_dir, fake_engine_env, stubs):
+    source = tmp_path / FIXTURE_RECEPTOR.name
+    shutil.copyfile(FIXTURE_RECEPTOR, source)
+    plist, smiles = make_inputs(tmp_path, example_dir, ligands=("molecule1",), proteins=[source])
+    pockets = tmp_path / "pockets"
+    pockets.mkdir()
+    cfg = atlas_config(plist, smiles, tmp_path / "results", tmp_path / "tmp", top_pockets=1,
+                       pockets_dir=str(pockets))
+    pipeline.run_atlas(cfg)
+    before = len(fake_engine_env.calls()), len(stubs)
+    write_pockets(pockets / f"{source.stem}.csv", 1)
+    with pytest.raises(pipeline.RunAborted, match="pocket_source"):
+        pipeline.run_atlas(cfg)
+    assert (len(fake_engine_env.calls()), len(stubs)) == before
+
+
+def test_input_identity_resume_moved_content(input_identity_run, fake_engine_env, stubs, monkeypatch, tmp_path):
+    cfg, source, csv = input_identity_run
+    moved = tmp_path / "moved" / source.name
+    moved.parent.mkdir()
+    shutil.copyfile(source, moved)
+    Path(cfg.protein_paths).write_text(f"{moved}\n")
+    out = Path(cfg.output_dir)
+    before = {f: (out / f).read_bytes() for f in results_files(out)}
+    n_calls, n_predictions = len(fake_engine_env.calls()), len(stubs)
+    prepare_ligands = pipeline.prepare_ligands
+
+    def no_preparation(*args, **kw):
+        pytest.fail("resume prepared ligands or receptor again")
+
+    monkeypatch.setattr(pipeline, "prepare_ligands", no_preparation)
+    monkeypatch.setattr(pipeline, "receptor_pdbqt", no_preparation)
+    pipeline.run_atlas(cfg)
+    assert len(fake_engine_env.calls()) == n_calls and len(stubs) == n_predictions
+    assert {f: (out / f).read_bytes() for f in results_files(out)} == before
+    # The supplied CSV may move too; --force accepts the changed run-level directory setting.
+    csv.rename(moved.parent / csv.name)
+    # Existing forced settings changes prepare ligands again, while retaining completed proteins.
+    monkeypatch.setattr(pipeline, "prepare_ligands", prepare_ligands)
+    pipeline.run_atlas(dataclasses.replace(cfg, pockets_dir=str(moved.parent)), force=True)
+    assert len(fake_engine_env.calls()) == n_calls and len(stubs) == n_predictions
+    assert {f: (out / f).read_bytes() for f in before if f != "MANIFEST.json"} == {
+        f: data for f, data in before.items() if f != "MANIFEST.json"}
+
+
+def test_input_identity_resume_gzip_metadata(tmp_path, example_dir, fake_engine_env, stubs):
+    source = tmp_path / f"{FIXTURE_RECEPTOR.name}.gz"
+    raw = FIXTURE_RECEPTOR.read_bytes()
+    source.write_bytes(gzip.compress(raw, mtime=1))
+    plist, smiles = make_inputs(tmp_path, example_dir, ligands=("molecule1",), proteins=[source])
+    cfg = atlas_config(plist, smiles, tmp_path / "results", tmp_path / "tmp", top_pockets=1)
+    pipeline.run_atlas(cfg)
+    out = Path(cfg.output_dir)
+    before = {f: (out / f).read_bytes() for f in results_files(out)}
+    n_calls, n_predictions = len(fake_engine_env.calls()), len(stubs)
+    source.write_bytes(gzip.compress(raw, mtime=2))
+    pipeline.run_atlas(cfg)
+    assert len(fake_engine_env.calls()) == n_calls and len(stubs) == n_predictions
+    assert {f: (out / f).read_bytes() for f in results_files(out)} == before
+
+
+@pytest.mark.parametrize("invalid", [None, {}, [], "invalid", {"version": 2}, {"version": True},
+                                    {"structure_sha256": "wrong"}, {"pockets_sha256": None},
+                                    {"pocket_source": "unknown"}, {"pockets_sha256": "wrong"}])
+def test_input_identity_invalid_saved_metadata(input_identity_run, fake_engine_env, invalid):
+    cfg, source, _ = input_identity_run
+    out = Path(cfg.output_dir)
+    manifest = out / "manifest" / f"{source.stem}.json"
+    saved = json.loads(manifest.read_text())
+    identity = saved["summary"]["input_identity"]
+    saved["summary"]["input_identity"] = dict(identity, **invalid) if isinstance(invalid, dict) and invalid else invalid
+    manifest.write_text(json.dumps(saved))
+    before = {f: (out / f).read_bytes() for f in results_files(out)}
+    n_calls = len(fake_engine_env.calls())
+    with pytest.raises(pipeline.RunAborted, match="input_identity"):
+        pipeline.run_atlas(cfg)
+    assert len(fake_engine_env.calls()) == n_calls
+    assert {f: (out / f).read_bytes() for f in results_files(out)} == before
+
+
+def test_input_identity_legacy_warning_once(tmp_path, example_dir, fake_engine_env, stubs, caplog):
+    sources = [tmp_path / f"legacy{i}.pdbqt" for i in range(2)]
+    for source in sources:
+        shutil.copyfile(FIXTURE_RECEPTOR, source)
+    plist, smiles = make_inputs(tmp_path, example_dir, ligands=("molecule1",), proteins=sources)
+    cfg = atlas_config(plist, smiles, tmp_path / "results", tmp_path / "tmp", top_pockets=1)
+    pipeline.run_atlas(cfg)
+    out = Path(cfg.output_dir)
+    for source in sources:
+        manifest = out / "manifest" / f"{source.stem}.json"
+        saved = json.loads(manifest.read_text())
+        del saved["summary"]["input_identity"]
+        manifest.write_text(json.dumps(saved))
+        source.unlink()  # Legacy identity cannot be checked, even when today's source is unavailable.
+    before = {f: (out / f).read_bytes() for f in results_files(out)}
+    n_calls = len(fake_engine_env.calls())
+    for _ in range(2):
+        caplog.clear()
+        pipeline.run_atlas(cfg)
+        warnings = [r.message for r in caplog.records if "could not be verified" in r.message]
+        assert len(warnings) == 1 and "legacy" in warnings[0]
+    assert len(fake_engine_env.calls()) == n_calls
+    assert {f: (out / f).read_bytes() for f in results_files(out)} == before
+
+
+def test_input_identity_abort_cancels_earlier_engine(input_identity_run, fake_engine_env, monkeypatch, tmp_path):
+    cfg, source, _ = input_identity_run
+    other = tmp_path / "queued.pdbqt"
+    shutil.copyfile(source, other)
+    source.write_bytes(source.read_bytes() + b"REMARK changed\n")
+    Path(cfg.protein_paths).write_text(f"{other}\n{source}\n")
+    wait_dir = tmp_path / "engine_wait"
+    wait_dir.mkdir()
+    monkeypatch.setenv("POCKETVINA_FAKE_ENGINE_WAIT_FOR", str(wait_dir))
+    check = pipeline._check_resume_identity
+    started = []
+
+    def wait_then_check(*args):
+        deadline = time.monotonic() + 15
+        while not list(wait_dir.glob("started-*")) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        started.extend(int(p.name.split("-")[1]) for p in wait_dir.glob("started-*"))
+        assert started, "the earlier protein's engine never started"
+        return check(*args)
+
+    monkeypatch.setattr(pipeline, "_check_resume_identity", wait_then_check)
+    out = Path(cfg.output_dir)
+    before = {f: (out / f).read_bytes() for f in results_files(out)}
+    with pytest.raises(pipeline.RunAborted, match="structure_sha256"):
+        pipeline.run_atlas(cfg)
+    assert started and all(not _alive(pid) for pid in started)
+    assert {f: (out / f).read_bytes() for f in results_files(out)} == before
+    assert os.listdir(cfg.tmp_dir) == []
+    assert not any(t.name.startswith("pocketvina-") for t in threading.enumerate())
+
+
 def test_atlas_rerun_skips_done_proteins_and_ligand_preparation(tmp_path, example_dir, fake_engine_env, stubs,
                                                                monkeypatch):
     plist, smiles = make_inputs(tmp_path, example_dir)
