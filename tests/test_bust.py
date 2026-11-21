@@ -10,6 +10,7 @@ monkeypatched here is the one they run (timeouts, dying workers).
 
 The whole module is skipped without PoseBusters (it is an optional dependency); about 30 s with it.
 """
+import errno
 import functools
 import json
 import multiprocessing
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -683,8 +685,58 @@ def _running(pid: int) -> bool:
     try:
         with open(f"/proc/{pid}/stat") as f:
             return f.read().rsplit(")", 1)[1].split()[0] != "Z"
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return False
+
+
+def test_running_returns_false_when_process_disappears_during_read(monkeypatch):
+    stat = StringIO()
+
+    def read():
+        raise ProcessLookupError(errno.ESRCH, "No such process")
+
+    monkeypatch.setattr(stat, "read", read)
+    monkeypatch.setitem(globals(), "open", lambda path: stat)
+    assert _running(123) is False
+
+
+@pytest.mark.parametrize("status, running", [("R", True), ("S", True), ("Z", False)])
+def test_running_reads_process_status(monkeypatch, status, running):
+    stat = StringIO(f"123 (worker (name)) {status} 1 2 3")
+    monkeypatch.setitem(globals(), "open", lambda path: stat)
+    assert _running(123) is running
+
+
+@pytest.mark.parametrize("operation, error", [
+    ("open", FileNotFoundError(errno.ENOENT, "No such file or directory")),
+    ("read", FileNotFoundError(errno.ENOENT, "No such file or directory")),
+    ("open", ProcessLookupError(errno.ESRCH, "No such process")),
+])
+def test_running_returns_false_when_process_disappears(monkeypatch, operation, error):
+    stat = StringIO()
+
+    def fail(*args):
+        raise error
+
+    monkeypatch.setitem(globals(), "open", fail if operation == "open" else lambda path: stat)
+    monkeypatch.setattr(stat, "read", fail)
+    assert _running(123) is False
+
+
+@pytest.mark.parametrize("operation", ["open", "read"])
+@pytest.mark.parametrize("error", [PermissionError(errno.EACCES, "Permission denied"),
+                                  OSError(errno.EIO, "Input/output error")])
+def test_running_propagates_unrelated_io_errors(monkeypatch, operation, error):
+    stat = StringIO()
+
+    def fail(*args):
+        raise error
+
+    monkeypatch.setitem(globals(), "open", fail if operation == "open" else lambda path: stat)
+    monkeypatch.setattr(stat, "read", fail)
+    with pytest.raises(type(error)) as exc:
+        _running(123)
+    assert exc.value is error
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG and /proc are Linux only")
