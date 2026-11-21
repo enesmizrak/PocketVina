@@ -580,7 +580,8 @@ proteins done are skipped); 3 nothing docked.
               help="TOML file with these options (see below).")
 @click.option("--force", is_flag=True,
               help="atlas: replace the run definition of a results directory that holds a run with other settings "
-                   "or ligands.")
+                   "or ligands. Retain completed proteins if ordered ligand IDs and input SMILES are unchanged. "
+                   "Use a new output directory to recompute every requested protein.")
 @click.pass_context
 def dock(ctx, **cli_opts):
     """Dock ligands into the P2Rank pockets of proteins.

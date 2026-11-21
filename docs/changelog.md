@@ -2,6 +2,12 @@
 
 ## Not released yet
 
+### Changed
+
+- Clarified atlas `dock --force` help and documentation: replacing the run definition retains completed proteins
+  when the ordered ligand IDs and input SMILES are unchanged. A new output directory is required to recompute
+  every requested protein with new settings or changed inputs; force does not guarantee full recomputation or cleanup.
+
 ### Fixed
 
 - Interrupted atlas initialization recovers the exact elected prepared ligands from a retained immutable snapshot,

@@ -15,7 +15,8 @@ results folder. This covers `Results`, `show()`, `bust()` and the commands `info
 
 ### How do I resume a run that stopped?
 
-Run the same command or code again. Proteins that are done are skipped, and all others are docked.
+Run the same command or code again with the same settings and ligand list. Proteins that are done are skipped,
+and all others are prepared and docked.
 For newly computed results, PocketVina verifies the structure and supplied pocket CSV contents before skipping.
 Moving identical inputs or changing only gzip metadata is harmless. Older or imported results without stored input
 identity are still skipped, with one warning per invocation that their identity could not be verified.
@@ -30,8 +31,16 @@ also stop reuse; restore the original readable inputs or use a new output direct
 
 ### The run stops with "... holds another run"
 
-A results folder holds one run with one set of ligands and settings. Use a new `--out` folder, or `--force` to
-replace the run.
+A results directory refuses different settings or ligands without `--force`. That option replaces the run
+definition, but retains completed proteins when the ordered ligand IDs and input SMILES still map to the same
+indexes. Changing a seed with `--force`, for example, leaves those proteins' original results in place; remaining
+proteins use the new settings, so results can mix settings.
+
+If `--force` changes the ordered ligand IDs or input SMILES, it invalidates completion markers because the ligand
+indexes changed, and requested proteins are docked again. It does not guarantee deletion of every old artifact.
+To recompute **every requested protein** with new settings or changed inputs, use a **new output directory** with
+`--out`. Force does not guarantee full recomputation or cleanup and does not bypass input-identity checks for
+retained completed proteins. See the seed-change example in [Results format](output-format.md).
 
 ### The engine runs out of GPU memory
 

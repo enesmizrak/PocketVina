@@ -152,6 +152,14 @@ def test_dock_help_documents_the_config_file_and_exit_codes():
         assert needle in text, needle
 
 
+def test_dock_force_help_documents_retention_and_full_recomputation():
+    text = " ".join(ok(invoke("dock", "--help")).stdout.split())
+    for needle in ("replace the run definition", "Retain completed proteins",
+                   "if ordered ligand IDs and input SMILES are unchanged",
+                   "Use a new output directory to recompute every requested protein"):
+        assert needle in text, needle
+
+
 def test_version_and_usage_errors_exit_with_1():
     from pocketvina import __version__
 

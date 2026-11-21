@@ -60,9 +60,32 @@ warning per invocation that their input identity could not be verified. No curre
 legacy manifests. A present but invalid field is an error. This extension changes neither the Parquet schemas nor
 the PVATLAS1 pose format.
 
-A folder holds one run. `MANIFEST.json` keeps the settings that change the results, such as box, seed, pockets and
-P2Rank model. Docking into the folder with other settings or ligands is refused. Use a new folder, or `--force` to
-replace the run. You can change the GPUs, the temp folder and the timeouts.
+`MANIFEST.json` holds the current run definition: the prepared ligands and settings that change the results, such
+as box, seed, pockets and P2Rank model. Reusing a results directory follows these rules:
+
+- With the same settings and ligand list, and unchanged protein inputs, completed proteins are reused; the remaining
+  proteins are prepared and docked. You can change the GPUs, the temp folder and the timeouts.
+- Other settings or ligands are refused without `--force`.
+- With `--force`, the run definition is replaced. Completed proteins are retained if the ordered ligand IDs and
+  input SMILES still map to the same ligand indexes, even if the settings or prepared ligand coordinates changed.
+  Retained proteins keep their original results and per-protein settings, so the directory can contain results
+  computed with different settings. The current `MANIFEST.json` does not establish that all proteins used its settings.
+- If `--force` changes the ordered ligand IDs or input SMILES, completion markers are invalidated because the old
+  ligand indexes no longer describe the list. Requested proteins are docked again. This does not guarantee deletion
+  of every old artifact.
+
+To recompute **every requested protein** with new settings or changed inputs, use a **new output directory**.
+`--force` does not guarantee full recomputation or cleanup, and it does not bypass the input-identity checks for
+retained completed proteins described above. For example, these commands compute all requested proteins separately
+with each seed:
+
+```bash
+pocketvina dock --proteins proteins.txt --ligands ligands.csv --out results-seed-7 --seed 7
+pocketvina dock --proteins proteins.txt --ligands ligands.csv --out results-seed-8 --seed 8
+```
+
+Using `--out results-seed-7 --seed 8 --force` instead would retain its completed proteins when the ordered ligand IDs
+and input SMILES are unchanged, leaving their seed-7 results in place.
 
 New run manifests also contain `initial_ligands`, an object with a relative `path` under `initialization/` and
 the snapshot file's `sha256`. The snapshot is fully written, synced and verified before a process elects the run

@@ -98,8 +98,13 @@ part=$(printf "proteins.part.%03d" "$SLURM_ARRAY_TASK_ID")
 pocketvina dock --proteins "$part" --ligands ligands.csv --out results --top-pockets 5
 ```
 
-The first task prepares the ligands, and later tasks reuse them. Do not use `--force` in array tasks. It replaces
-the run that the other tasks write into.
+The first task prepares the ligands, and later tasks reuse them. Do not use `--force` in array tasks: rewriting
+the shared run definition conflicts with other workers using its settings and prepared ligands. Force retains
+completed proteins when the ordered ligand IDs and input SMILES keep the same indexes, so changing settings can
+leave results computed with different settings. Changing that ligand mapping invalidates completion markers;
+requested proteins dock again, without a guarantee that every old artifact is deleted. To recompute every requested
+protein with new settings or changed inputs, submit the array with a **new output directory**. Force does not
+guarantee full recomputation or cleanup, or bypass input-identity checks for retained completed proteins.
 
 ## Resume and check
 
