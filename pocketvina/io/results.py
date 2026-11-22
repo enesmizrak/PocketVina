@@ -20,7 +20,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .. import pdbqt
-from . import posefile, tables
+from . import pb, posefile, tables
+from .pb import _READ_PARQUET, PB_KEY, _sql_list
 from .sas import decode as decode_sas
 from .writer import FORMAT, ResultsDir
 
@@ -41,12 +42,8 @@ MAX_OPEN_POSE_FILES = 16
 MAX_STEM = 100
 _STRUCTURE_EXTS = (".pdb.gz", ".cif.gz", ".pdbqt.gz", ".pdb", ".cif", ".pdbqt")
 _UNSAFE_CHARS = re.compile(r"[^A-Za-z0-9._-]")
-# DuckDB's read_parquet options; without hive_partitioning = false, a key=value folder anywhere in the results path
-# ("/scratch/run=1/results") becomes an extra column of every view (pq.read_table: partitioning=None, the same)
-_READ_PARQUET = "union_by_name = true, hive_partitioning = false"
 # PoseBusters results (pocketvina.bust): columns pairs() adds, join keys, schema metadata of a part
 PAIRS_DERIVED = ("pb_valid", "ligand_efficiency")
-PB_KEY = ("protein_id", "ligand_idx", "pocket", "mode")
 PB_JOIN = ("protein_id", "ligand_idx", "best_pocket", "best_mode")
 PB_CHECKS_META = b"pocketvina.pb_checks"
 PB_POSES_META = b"pocketvina.poses_sha256"
@@ -80,24 +77,11 @@ def _to_csv(df: pd.DataFrame, path_or_file, **kw) -> None:
         df.to_csv(path_or_file, line_terminator="\n", **kw)
 
 
-def _sql_str(s: str) -> str:
-    return "'" + s.replace("'", "''") + "'"
-
-
-def _sql_list(strings: Iterable[str]) -> str:
-    return "[" + ", ".join(_sql_str(s) for s in strings) + "]"
-
-
 def _concat(parts: List[pa.Table]) -> pa.Table:
     try:
         return pa.concat_tables(parts, promote_options="permissive")
     except TypeError:  # pyarrow < 14
         return pa.concat_tables(parts, promote=True)
-
-
-def _read_parts(files: List[str], columns: Optional[List[str]] = None) -> pd.DataFrame:
-    parts = [pq.read_table(f, columns=columns, partitioning=None).replace_schema_metadata(None) for f in files]
-    return (parts[0] if len(parts) == 1 else _concat(parts)).to_pandas()
 
 
 class Results:
@@ -187,6 +171,8 @@ class Results:
         schema = tables.SCHEMAS.get(name)
         if name != "ligands" and schema is None and not os.path.isdir(os.path.join(self.path, "tables", name)):
             raise KeyError(f"no table {name!r} in {self.path}")
+        if name == "posebusters":
+            return self.posebusters(protein, columns)
         if name == "ligands" and protein is not None:
             raise ValueError("the ligands table is not split by protein")
         columns = list(columns) if columns is not None else None
@@ -326,10 +312,10 @@ class Results:
             if need_valid:
                 df["pb_valid"] = pd.array([pd.NA] * len(df), dtype="boolean")
             return df
-        pb = _read_parts(files, [*PB_KEY, "pb_status", "pb_valid"])
-        pb = pb.drop_duplicates(list(PB_KEY)).rename(columns={"pocket": "best_pocket", "mode": "best_mode",
-                                                                "pb_status": "_pb_status"})
-        merged = df.merge(pb, how="left", on=list(PB_JOIN), sort=False, validate="many_to_one")
+        checks = pb.read(self._posebusters_parts(files), [*PB_KEY, "pb_status", "pb_valid"])
+        checks = checks.rename(columns={"pocket": "best_pocket", "mode": "best_mode",
+                                       "pb_status": "_pb_status"})
+        merged = df.merge(checks, how="left", on=list(PB_JOIN), sort=False, validate="many_to_one")
         merged.index = df.index
         found = merged["_pb_status"].notna()
         df["pb_status"] = merged["_pb_status"].where(found, df["pb_status"])
@@ -363,6 +349,11 @@ class Results:
                 out.append(path)
         return out
 
+    @staticmethod
+    def _posebusters_parts(files):
+        """Canonical file names identify the owner; row contents never supply ownership."""
+        return [(os.path.splitext(os.path.basename(path))[0], path) for path in files]
+
     def posebusters(self, protein: ProteinArg = None, columns: Optional[List[str]] = None) -> pd.DataFrame:
         """PoseBusters results (``tables.POSEBUSTERS``, written by ``pocketvina.bust.bust_results``) of one protein, a
         list or all committed proteins; empty if there are none. Results of a protein docked again since it was
@@ -372,7 +363,7 @@ class Results:
         if not files:
             empty = tables.POSEBUSTERS.empty_table()
             return (empty.select(columns) if columns is not None else empty).to_pandas()
-        return _read_parts(files, columns)
+        return pb.read(self._posebusters_parts(files), columns)
 
     def posebusters_checks(self, protein: str) -> List[str]:
         """Names of the PoseBusters checks in the mask bits of a protein's results (``bust.check_names``)."""
@@ -394,26 +385,31 @@ class Results:
         The ``pairs`` view has the columns of ``pairs()``: the ``pairs`` table with ``pb_status`` / ``pb_valid`` of
         the PoseBusters row of the highest-affinity pose (same pocket and mode; ``pb_valid`` is NULL without one,
         also when there are no PoseBusters results) and ``ligand_efficiency`` (``-vina / n_heavy``, NULL if
-        ``n_heavy`` is unknown).
+        ``n_heavy`` is unknown). Current check parts are validated before returning the connection. Reconnect
+        after concurrent part replacement; live views are not transactional multi-file snapshots.
         """
         import duckdb
 
         con = duckdb.connect()
-        for name in TABLES:
-            if name == "pairs":
-                continue  # below: it joins the ligands and the PoseBusters results
-            files = self._part_files(name)
-            if not files:
-                con.register(name, tables.SCHEMAS[name].empty_table())
-                continue
-            # an explicit file list, not a glob: a view is re-read at every query, and a glob would then also match
-            # the parts of a protein that another process is committing (no manifest yet)
-            con.execute(f"CREATE VIEW {name} AS SELECT * FROM read_parquet({_sql_list(files)}, {_READ_PARQUET})")
-        pb_files = self._posebusters_files()
-        if pb_files:
-            con.execute(f"CREATE VIEW posebusters AS SELECT * FROM read_parquet({_sql_list(pb_files)}, "
-                        f"{_READ_PARQUET})")
-        self._pairs_view(con, pb_files)
+        try:
+            for name in TABLES:
+                if name == "pairs":
+                    continue  # below: it joins the ligands and the PoseBusters results
+                files = self._part_files(name)
+                if not files:
+                    con.register(name, tables.SCHEMAS[name].empty_table())
+                    continue
+                # an explicit file list, not a glob: a view is re-read at every query, and a glob would then also match
+                # the parts of a protein that another process is committing (no manifest yet)
+                con.execute(f"CREATE VIEW {name} AS SELECT * FROM read_parquet({_sql_list(files)}, {_READ_PARQUET})")
+            pb_files = self._posebusters_files()
+            if pb_files:
+                source = pb.source(con, self._posebusters_parts(pb_files))
+                con.execute(f"CREATE VIEW posebusters AS {source}")
+            self._pairs_view(con, pb_files)
+        except BaseException:
+            con.close()
+            raise
         return con
 
     def _pairs_view(self, con, pb_files: List[str]) -> None:
@@ -423,18 +419,8 @@ class Results:
             con.register("pairs", PAIRS_VIEW.empty_table())
             return
         if pb_files:
-            # pairs(): the first row of each pose (in protein order, then file order) when a pose has several; the
-            # file positions come from a join (list_position over the file list per row costs rows x files)
-            key = ", ".join(f"r.{k}" for k in PB_KEY)
-            file_pos = ", ".join(f"({_sql_str(f)}, {n})" for n, f in enumerate(pb_files))
             pb_join = f"""
-            LEFT JOIN (
-                SELECT {key}, r.pb_status, r.pb_valid
-                FROM read_parquet({_sql_list(pb_files)}, {_READ_PARQUET}, filename = true,
-                                  file_row_number = true) AS r
-                LEFT JOIN (VALUES {file_pos}) AS f(filename, file_pos) ON f.filename = r.filename
-                QUALIFY row_number() OVER (PARTITION BY {key} ORDER BY f.file_pos, r.file_row_number) = 1
-            ) AS b ON {" AND ".join(f"b.{k} = p.{j}" for k, j in zip(PB_KEY, PB_JOIN))}"""
+            LEFT JOIN posebusters AS b ON {" AND ".join(f"b.{k} = p.{j}" for k, j in zip(PB_KEY, PB_JOIN))}"""
             pb_status, pb_valid = "coalesce(b.pb_status, p.pb_status)", "b.pb_valid"
         else:
             pb_join, pb_status, pb_valid = "", "p.pb_status", "CAST(NULL AS BOOLEAN)"

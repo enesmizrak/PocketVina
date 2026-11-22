@@ -17,8 +17,8 @@ from rdkit import Chem
 
 import fake_engine as fe
 from pocketvina import convert, pdbqt
+from pocketvina.io import pb, sas, tables
 from pocketvina.io import results as results_mod
-from pocketvina.io import sas, tables
 from pocketvina.io.importer import import_legacy
 from pocketvina.io.results import COMBINED_COLUMNS, Results, short_floats
 from pocketvina.io.writer import ProteinWriter, ResultsDir
@@ -349,9 +349,10 @@ def test_results_from_the_package():
     assert "Results" not in pocketvina.__all__
 
 
-def test_duckdb_pairs_view_with_posebusters(two_proteins, tmp_path):
+@pytest.mark.parametrize("conflicting", [False, True])
+def test_pb_integrity_duckdb_pairs_view_with_posebusters(two_proteins, tmp_path, conflicting):
     """pb_status / pb_valid of the PoseBusters row of the best pose, joined as pairs() does: rows of other poses do
-    not count (pb_status stays the pairs table's), the first row of a pose seen twice wins, and parts that do not
+    not count (pb_status stays the pairs table's), identical repeats are normalized, and parts that do not
     match the protein's pose file are left out."""
     pytest.importorskip("duckdb")
     path = tmp_path / "results"
@@ -361,11 +362,16 @@ def test_duckdb_pairs_view_with_posebusters(two_proteins, tmp_path):
     k5, m5 = (int(v) for v in best.loc[(PID, 1), ["best_pocket", "best_mode"]])
     k10, m10 = (int(v) for v in best.loc[(PID, 2), ["best_pocket", "best_mode"]])  # no pose
     write_pb_part(path, PID, [(0, "molecule2", k2, m2, "valid", True),
-                              (0, "molecule2", k2, m2, "invalid", False),  # the same pose again: ignored
+                              (0, "molecule2", k2, m2, "invalid" if conflicting else "valid", not conflicting),
                               (1, "molecule5", k5, m5 + 1, "invalid", False),  # another pose
                               (2, "molecule10", k10, m10, "no_pose", None)])
     write_pb_part(path, PID2, [(1, "molecule5", k5, m5, "timeout", None), (0, "molecule2", k2, m2, "invalid", False)])
     with Results(path) as r:
+        if conflicting:
+            for read in (r.posebusters, r.pairs, r.duckdb):
+                with pytest.raises(pb.PoseBustersIntegrityError, match="conflicting-records"):
+                    read()
+            return
         con = r.duckdb()
         got = _sorted_pairs(con.execute("SELECT * FROM pairs").fetchdf())
         want = _sorted_pairs(r.pairs())
@@ -375,7 +381,7 @@ def test_duckdb_pairs_view_with_posebusters(two_proteins, tmp_path):
                                                                    "pb_valid"]])] == sorted([
             (PID, 0, "valid", True), (PID, 1, None, None), (PID, 2, "no_pose", None),
             (PID2, 0, "invalid", False), (PID2, 1, "timeout", None), (PID2, 2, None, None)])
-        assert con.execute("SELECT count(*) FROM posebusters").fetchone() == (6,)
+        assert con.execute("SELECT count(*) FROM posebusters").fetchone() == (5,)
         assert con.execute("SELECT count(*) FROM pairs WHERE pb_valid").fetchone() == (1,)
 
     # a part made from another pose file (the protein was docked again since): left out, as by pairs()
@@ -389,9 +395,8 @@ def test_duckdb_pairs_view_with_posebusters(two_proteins, tmp_path):
         assert got[got.protein_id == PID2].pb_status.isna().all()
 
 
-def test_duckdb_pairs_view_first_part_wins(two_proteins, tmp_path):
-    """A pose found in two PoseBusters parts takes the row of the first part in protein order, as pairs() does,
-    even when that row comes later in its file than the other part's row."""
+def test_pb_integrity_rejects_misplaced_rows(two_proteins, tmp_path):
+    """The previous cross-part fixture is rejected instead of borrowing another protein's row."""
     pytest.importorskip("duckdb")
     path = tmp_path / "results"
     shutil.copytree(two_proteins.path, path)
@@ -407,11 +412,12 @@ def test_duckdb_pairs_view_first_part_wins(two_proteins, tmp_path):
                                  pb_na_mask=0) for p, mode, status, valid in rows],
                            tables.POSEBUSTERS, folder / f"{pid}.parquet")
     with Results(path) as r:
-        want = _sorted_pairs(r.pairs())
-        got = _sorted_pairs(r.duckdb().execute("SELECT * FROM pairs").fetchdf())
-        assert _plain_values(got) == _plain_values(want)
-        row = got[(got.protein_id == PID) & (got.ligand_idx == 0)]
-        assert (row.pb_status.tolist(), row.pb_valid.isna().tolist()) == (["error"], [True])
+        for read in (r.pairs, r.posebusters, r.duckdb,
+                     lambda: r.posebusters(columns=["pb_status"]),
+                     lambda: r.pairs(columns=["pb_status"])):
+            with pytest.raises(pb.PoseBustersIntegrityError, match="wrong-owner"):
+                read()
+        assert len(r.pairs(columns=["ligand_idx", "best_pocket"])) == 6
 
 
 def test_empty_results(tmp_path):
@@ -781,3 +787,90 @@ def test_export_file_names_of_long_ligand_ids(tmp_path):
         assert sorted(names) == sorted([f"prot-pocket1-{stem}_best.pdbqt", f"prot-pocket1-{stem}_1_best.pdbqt",
                                         "prot-pocket1-short_best.pdbqt"])
         assert len(r.export(tmp_path / "out", "best", "sdf")) == 3
+
+
+@pytest.mark.parametrize("column,value", [("pb_status", "invalid"), ("pb_mask", 1),
+                                         ("pb_config", "other"), ("runtime_s", 2.0)])
+def test_pb_integrity_all_readers_and_replacement(res_copy, column, value):
+    """Projection cannot hide a conflict; each new read revalidates without a persistent cache."""
+    part = write_pb_part(res_copy.path, PID, [(0, "molecule2", 2, 1, "valid", True)])
+    unique = pq.read_table(part)
+    assert len(res_copy.posebusters()) == 1
+    rows = unique.to_pylist()
+    rows.append({**rows[0], column: value})
+    tables.write_table(rows, unique.schema, part)
+    before = part.read_bytes()
+    for read in (res_copy.posebusters, res_copy.pairs, res_copy.duckdb,
+                 lambda: res_copy.table("posebusters"),
+                 lambda: res_copy.posebusters(columns=["pb_status"]),
+                 lambda: res_copy.pairs(columns=["pb_status"])):
+        with pytest.raises(pb.PoseBustersIntegrityError, match="conflicting-records"):
+            read()
+    assert len(res_copy.pairs(columns=["ligand_idx", "best_pocket"])) == 3
+    assert res_copy.posebusters_checks(PID) == []  # metadata access does not scan the check rows
+    assert part.read_bytes() == before
+    pq.write_table(unique, part)
+    assert len(res_copy.posebusters()) == 1 and res_copy.pairs().pb_status[0] == "valid"
+    with res_copy.duckdb() as con:
+        assert con.execute("SELECT count(*) FROM posebusters").fetchone() == (1,)
+
+
+def test_pb_integrity_identical_nullable_records(res_copy):
+    part = write_pb_part(res_copy.path, PID, [(1, "molecule5", 1, 1, "timeout", None),
+                                            (0, "molecule2", 2, 1, "valid", True)])
+    unique = pq.read_table(part)
+    expected = unique.to_pandas()
+    import pyarrow as pa
+
+    pq.write_table(pa.concat_tables([unique.slice(0, 1), unique, unique]), part, row_group_size=1)
+    assert len(pq.read_table(part)) == 5  # raw diagnosis remains possible
+    pd.testing.assert_frame_equal(res_copy.posebusters(), expected)
+    pd.testing.assert_frame_equal(res_copy.posebusters(columns=["pb_status"]), expected[["pb_status"]])
+    pairs = res_copy.pairs(columns=["ligand_idx", "pb_status", "pb_valid"])
+    assert pairs.pb_status.tolist() == ["valid", "timeout", None]
+    assert pairs.pb_valid.tolist()[0] and pairs.pb_valid.isna().tolist() == [False, True, True]
+    with res_copy.duckdb() as con:
+        assert con.execute("SELECT count(*) FROM posebusters").fetchone() == (2,)
+        assert con.execute("SELECT ligand_idx, pb_status, pb_valid FROM pairs ORDER BY ligand_idx").fetchall() == [
+            (0, "valid", True), (1, "timeout", None), (2, None, None)]
+
+
+def test_pb_integrity_scoping_and_freshness(two_proteins, tmp_path):
+    path = tmp_path / "results"
+    shutil.copytree(two_proteins.path, path)
+    part = write_pb_part(path, PID, [(0, "molecule2", 2, 1, "valid", True),
+                                     (0, "molecule2", 2, 1, "invalid", False)])
+    write_pb_part(path, PID2, [(0, "molecule2", 2, 1, "valid", True)])
+    with Results(path) as r:
+        assert len(r.posebusters((p for p in [PID2]))) == 1
+        assert len(r.pairs((p for p in [PID2]))) == 3
+        with pytest.raises(pb.PoseBustersIntegrityError):
+            r.posebusters(PID)
+        table = pq.read_table(part)
+        pq.write_table(table.replace_schema_metadata({results_mod.PB_POSES_META: b"0" * 64}), part)
+        # Stale and uncommitted conflicts never reach validation.
+        shutil.copy(part, part.with_name("uncommitted.parquet"))
+        assert len(r.posebusters()) == 1
+        assert r.posebusters(PID).empty
+        with r.duckdb() as con:
+            assert con.execute("SELECT count(*) FROM posebusters").fetchone() == (1,)
+
+
+def test_pb_integrity_duckdb_closes_failed_setup(res_copy, monkeypatch):
+    import duckdb
+
+    write_pb_part(res_copy.path, PID, [(0, "molecule2", 2, 1, "valid", True),
+                                      (0, "molecule2", 2, 1, "invalid", False)])
+    connect, opened = duckdb.connect, []
+
+    def tracked():
+        con = connect()
+        opened.append(con)
+        return con
+
+    monkeypatch.setattr(duckdb, "connect", tracked)
+    with pytest.raises(pb.PoseBustersIntegrityError):
+        res_copy.duckdb()
+    assert len(opened) == 1
+    with pytest.raises(duckdb.Error, match="closed"):
+        opened[0].execute("SELECT 1")

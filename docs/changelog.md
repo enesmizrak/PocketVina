@@ -20,6 +20,9 @@
 
 ### Fixed
 
+- Stored PoseBusters checks now reject conflicting records for a pose key and rows in another protein's part,
+  consistently across result readers, joins and pages. Exact repeats normalize to one result; explicit
+  `bust --overwrite` recomputes an ambiguous check set without silently choosing a row.
 - Atlas JSON and Parquet reads recover malformed cached files with one fresh download per read, validating it
   before replacing cached bytes. Invalid responses are not published; valid final-release caches remain reusable
   offline after metadata is read, and local files and supplied digest checks retain their existing behavior.

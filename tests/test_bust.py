@@ -1072,3 +1072,86 @@ def test_posebusters_config_options(tmp_path, example_dir, fake_engine_env, stub
     with pytest.raises(ImportError, match="pip install posebusters"):
         pipeline.run_atlas(PocketVinaGPU(config))
     assert fake_engine_env.calls() == [] and not (tmp_path / "out").exists()  # nothing docked
+
+
+@pytest.mark.parametrize("injection", ["conflict", "wrong-owner", "identical"])
+def test_pb_integrity_publication_and_cleanup(imported, tmp_path, monkeypatch, injection, caplog):
+    from pocketvina.io.pb import PoseBustersIntegrityError
+    from test_io_results import write_pb_part
+
+    path = copy_results(imported, tmp_path)
+    part = write_pb_part(path, PID, [(0, "molecule2", 2, 1, "valid", True)])
+    before = part.read_bytes()
+    tmp = tmp_path / "tmp"
+    select = bust._select_poses
+    row = bust._Session._row
+    seen = []
+
+    def repeated(*args):
+        poses = select(*args)
+        return poses + [poses[0]]
+
+    def injected(self, *args):
+        result = row(self, *args)
+        if len(seen) == 3:
+            if injection == "conflict":
+                result["error"] = "different diagnostic"
+            elif injection == "wrong-owner":
+                result["protein_id"] = "other"
+        seen.append(result)
+        return result
+
+    monkeypatch.setattr(bust, "_select_poses", repeated)
+    monkeypatch.setattr(bust._Session, "_row", injected)
+    monkeypatch.setattr(bust._Pool, "check", lambda self, protein, payloads, **kw: [
+        dict(status="timeout") for _ in payloads])
+    placed = []
+    place = bust.atomic_place
+
+    def publish(*args):
+        placed.append(True)
+        return place(*args)
+
+    monkeypatch.setattr(bust, "atomic_place", publish)
+    caplog.set_level("INFO", logger="pocketvina.bust")
+    if injection == "identical":
+        assert bust.bust_results(path, overwrite=True, tmp_dir=str(tmp)) == [PID]
+        assert len(pq.read_table(part)) == 3
+        assert "on 3 poses" in caplog.text and placed == [True]
+        with Results(path) as res:
+            assert len(res.posebusters()) == 3
+    else:
+        with pytest.raises(PoseBustersIntegrityError):
+            bust.bust_results(path, overwrite=True, tmp_dir=str(tmp))
+        assert part.read_bytes() == before and placed == []
+    assert tmp.is_dir() and list(tmp.iterdir()) == []
+
+
+def test_pb_integrity_skip_and_explicit_overwrite_recovery(imported, tmp_path, monkeypatch):
+    from pocketvina.io.pb import PoseBustersIntegrityError
+    from test_io_results import write_pb_part
+
+    path = copy_results(imported, tmp_path)
+    part = write_pb_part(path, PID, [(0, "molecule2", 2, 1, "valid", True),
+                                     (0, "molecule2", 2, 1, "invalid", False)])
+    before = part.read_bytes()
+    tmp = tmp_path / "tmp"
+    with pytest.raises(PoseBustersIntegrityError, match="--overwrite"):
+        bust.bust_results(path, tmp_dir=str(tmp))
+    assert part.read_bytes() == before and list(tmp.iterdir()) == []
+    monkeypatch.setattr(bust._Pool, "check", lambda self, protein, payloads, **kw: [
+        dict(status="timeout") for _ in payloads])
+    assert bust.bust_results(path, overwrite=True, tmp_dir=str(tmp)) == [PID]
+    unique = pq.read_table(part)
+    with Results(path) as res:
+        assert res.posebusters().pb_status.tolist() == ["timeout", "timeout", "no_pose"]
+    # An eligible historical part with exact repeats is skipped without rewriting its bytes.
+    import pyarrow as pa
+
+    pq.write_table(pa.concat_tables([unique, unique]), part)
+    repeated = part.read_bytes()
+    assert bust.bust_results(path, tmp_dir=str(tmp)) == []
+    assert part.read_bytes() == repeated
+    with Results(path) as res:
+        assert len(res.posebusters()) == 3
+    assert list(tmp.iterdir()) == []

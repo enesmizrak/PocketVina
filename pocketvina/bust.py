@@ -45,7 +45,7 @@ import pyarrow.parquet as pq
 from . import pdbqt
 from .convert import pose_to_sdf
 from .engine import exit_on_sigterm
-from .io import tables
+from .io import pb, tables
 from .io.results import Results
 from .io.writer import atomic_place, resolve_tmp_dir
 
@@ -763,6 +763,18 @@ class _Session:
         if meta.get(META_POSES) not in (None, poses_sha):
             logger.info("%s: docked again since its PoseBusters checks, checking again", pid)
             return True
+        import duckdb
+
+        con = duckdb.connect()
+        try:
+            pb.source(con, [(pid, dst)])
+        except pb.PoseBustersIntegrityError:
+            raise
+        except Exception as e:  # ordinary I/O/schema failures retain the existing recompute policy
+            logger.warning("%s: unreadable PoseBusters table %s (%s), checking again", pid, dst, e)
+            return True
+        finally:
+            con.close()
         if (meta.get(META_CONFIG), meta.get(META_SELECT)) != (self.pb_config, self.select_meta):
             logger.warning("%s: keeping the PoseBusters results made with config %s, %s (overwrite=True replaces "
                            "them)", pid, meta.get(META_CONFIG), meta.get(META_SELECT))
@@ -799,12 +811,13 @@ class _Session:
         if poses_sha:  # lets a later call (and Results) tell that the protein was docked again since
             schema = schema.with_metadata({**schema.metadata, META_POSES.encode(): poses_sha.encode()})
         local = os.path.join(self.tmp, f"{pid}.parquet")
-        tables.write_table(rows, schema, local)
+        candidate = pb.normalize(tables.to_arrow(rows, schema), pid, self.target(pid))
+        tables.write_table(candidate, schema, local)
         atomic_place(local, self.target(pid))
         dt = time.monotonic() - t0
-        counts = Counter(r["pb_status"] for r in rows)
+        counts = Counter(candidate["pb_status"].to_pylist())
         logger.info("%s: PoseBusters %s on %d poses: %s (%.1f s, %.2f s per checked pose)", pid, self.pb_config,
-                    len(rows), dict(counts), dt, dt / len(todo) if todo else 0.0)
+                    len(candidate), dict(counts), dt, dt / len(todo) if todo else 0.0)
         return True
 
     def _payloads(self, pid: str, poses: List[_Pose]) -> Callable[[int], tuple]:

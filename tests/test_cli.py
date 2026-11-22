@@ -1225,3 +1225,26 @@ def test_bench_gpu_out_must_be_writable_before_it_runs(tmp_path, example_dir, fa
     finally:
         read_only.chmod(0o755)
     assert fake_engine_env.calls() == [] and not (tmp_path / "tmp").exists()  # checked before any work
+
+
+def test_pb_integrity_cli_error_and_explicit_recovery(imported, tmp_path, monkeypatch):
+    from pocketvina import bust
+    from test_io_results import write_pb_part
+
+    pytest.importorskip("posebusters")
+    path = copy_results(imported, tmp_path / "results")
+    part = write_pb_part(path, PID, [(0, "molecule2", 2, 1, "valid", True),
+                                     (0, "molecule2", 2, 1, "invalid", False)])
+    before = part.read_bytes()
+    tmp = tmp_path / "tmp"
+    result = invoke("bust", "--results", path, "--protein", PID, "--tmp-dir", tmp)
+    assert result.exit_code == cli.EXIT_USAGE
+    assert "conflicting-records" in result.output and "--overwrite" in result.output
+    assert part.read_bytes() == before and list(tmp.iterdir()) == []
+    monkeypatch.setattr(bust._Pool, "check", lambda self, protein, payloads, **kw: [
+        dict(status="timeout") for _ in payloads])
+    result = ok(invoke("bust", "--results", path, "--protein", PID, "--overwrite", "--tmp-dir", tmp))
+    assert "1 proteins checked" in result.output
+    with Results(path) as res:
+        assert res.posebusters().pb_status.tolist() == ["timeout", "timeout", "no_pose"]
+    assert list(tmp.iterdir()) == []

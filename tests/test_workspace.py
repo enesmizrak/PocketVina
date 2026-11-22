@@ -27,6 +27,7 @@ import pytest
 
 from pocketvina import PocketVinaConfig, PocketVinaGPU, pdbqt, workspace
 from pocketvina.bust import _protein_pdb
+from pocketvina.io import pb
 from pocketvina.io.importer import import_legacy
 from pocketvina.io.results import PB_CHECKS_META, PB_POSES_META, Results, short_floats
 from pocketvina.selection import name_part
@@ -127,23 +128,6 @@ def old_listing(res, pids, max_ligands, selection=None) -> dict:
             (int(r.ligand_idx), float(r.vina), int(r.best_pocket), int(r.best_mode), round(r.ligand_efficiency, 3),
              int(r.rank), [int(r.protein_rank), int(r.n_proteins)] if r.n_proteins > 1 else None,
              with_pose.get(int(r.ligand_idx), [])) for r in shown.itertuples(index=False)])
-    return out
-
-
-def old_posebusters(res, pids) -> dict:
-    """The workspace's previous full-table reader, including last physical row wins for duplicate poses."""
-    out = {}
-    for pid in pids:
-        df = res.posebusters(pid)
-        if df.empty:
-            continue
-        n = len(res.posebusters_checks(pid))
-        for r in df.itertuples(index=False):
-            out[(pid, int(r.ligand_idx), int(r.pocket), int(r.mode))] = {
-                "status": r.pb_status, "valid": None if pd.isna(r.pb_valid) else bool(r.pb_valid),
-                "passed": bin(int(r.pb_mask)).count("1"),
-                "total": max(n - bin(int(r.pb_na_mask)).count("1"), 0),
-                "failed": r.failed_checks.split(",") if isinstance(r.failed_checks, str) and r.failed_checks else []}
     return out
 
 
@@ -319,11 +303,11 @@ def test_pb_filter_materializes_only_requested_checks(two, tmp_path, monkeypatch
         with monkeypatch.context() as patch:
             patch.setattr(duckdb, "connect", Connection)
             assert workspace._posebusters(r, rows) == wanted
-        assert fetched == [1] and closed == [True]
+        assert fetched == [0, 0, 1] and closed == [True]
         assert workspace.workspace_data(r, max_ligands=1) == expected_page
 
 
-def test_pb_filter_conflicting_duplicates_keep_last_physical_row(two, tmp_path, monkeypatch):
+def test_pb_integrity_conflicting_duplicates_across_row_groups(two, tmp_path, monkeypatch):
     path = tmp_path / "results"
     shutil.copytree(two.path, path)
     checks = [(0, "molecule2", 2, 1, "valid", True), (1, "molecule5", 1, 1, "invalid", False)]
@@ -341,25 +325,17 @@ def test_pb_filter_conflicting_duplicates_keep_last_physical_row(two, tmp_path, 
                           [(0, "molecule2", 2, 1, "valid", True), (1, "molecule5", 1, 1, "invalid", False)])
     with Results(path) as r:
         rows = workspace._listed(r, [PID], None, None)[0]
-        wanted = {(PID, int(row.ligand_idx), int(row.best_pocket), int(row.best_mode))
-                  for row in rows.itertuples(index=False)}
-
         def whole_table(*args, **kwargs):
-            raise AssertionError("workspace must join before fetching duplicate check records")
+            raise AssertionError("workspace must validate in DuckDB")
 
-        # Normally one part per protein; explicit file order must also win over row numbers across parts.
         for files in ([str(part)], [str(part), str(other)], [str(other), str(part)]):
             with monkeypatch.context() as patch:
                 patch.setattr(r, "_posebusters_files", lambda protein, files=files: files)
-                expected = old_posebusters(r, [PID])
-                expected = {key: expected[key] for key in wanted}
-                assert (expected[(PID, 0, 2, 1)]["status"], expected[(PID, 1, 1, 1)]["status"]) == (
-                    ("timeout", "error") if files[-1] == str(part) else ("valid", "invalid"))
                 patch.setattr(r, "posebusters", whole_table)
-                assert workspace._posebusters(r, rows) == expected
-                data = workspace.workspace_data(r, [PID], max_ligands=None)
-                assert {(PID, row["lig"], row["pocket"], row["mode"]): row["pb"]
-                        for row in data["proteins"][0]["rows"]} == expected
+                with pytest.raises(pb.PoseBustersIntegrityError, match="conflicting-records"):
+                    workspace._posebusters(r, rows)
+                with pytest.raises(pb.PoseBustersIntegrityError, match="conflicting-records"):
+                    workspace.workspace_data(r, [PID], max_ligands=None)
 
 
 @pytest.mark.parametrize("failure", ["register", "execute", "fetchall"])
@@ -368,25 +344,35 @@ def test_pb_filter_closes_connection_on_failure(two, monkeypatch, failure):
 
     rows = workspace._listed(two, [PID], 1, None)[0]
     closed = []
+    connect = duckdb.connect
 
     class Connection:
+        def __init__(self):
+            self.con = connect()
+
         def register(self, *args):
             if failure == "register":
                 raise RuntimeError("registration failed")
+            self.con.register(*args)
 
         def execute(self, *args):
             if failure == "execute":
                 raise RuntimeError("query failed")
+            self.con.execute(*args)
             return self
 
         def fetchall(self):
-            raise RuntimeError("fetch failed")
+            if failure == "fetchall":
+                raise RuntimeError("fetch failed")
+            return self.con.fetchall()
 
         def close(self):
+            self.con.close()
             closed.append(True)
 
     monkeypatch.setattr(duckdb, "connect", Connection)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match={"register": "registration", "execute": "query", "fetchall": "fetch"}[
+            failure]):
         workspace._posebusters(two, rows)
     assert closed == [True]
 
@@ -1022,3 +1008,36 @@ def test_page_text_says_highest_affinity():
     # spaces only: "best" before a dot or a quote is code (best.vina, view 'best'), not text
     assert not re.search(r"best\s+(poses?|modes?|scores?|vina|pockets?|drugs?|\d|\$\{)", text, re.IGNORECASE)
     assert ">Highest-affinity poses</th>" in text and "the pair's highest-affinity pose" in text
+
+
+@pytest.mark.parametrize("kind", ["hidden-conflict", "wrong-owner", "identical"])
+def test_pb_integrity_page_scope_and_validation_count(two, tmp_path, monkeypatch, kind):
+    path = tmp_path / "results"
+    shutil.copytree(two.path, path)
+    part = write_pb_part(path, PID, [(0, "molecule2", 2, 1, "valid", True),
+                                     (9000, "hidden", 1, 1, "timeout", None)])
+    table = pq.read_table(part)
+    rows = table.to_pylist()
+    rows.append({**rows[1], **({"pb_mask": 1} if kind == "hidden-conflict" else {})})
+    if kind == "wrong-owner":
+        rows[-1]["protein_id"] = PID2
+    from pocketvina.io import tables
+
+    tables.write_table(rows, table.schema, part)
+    source = pb.source
+    calls = []
+
+    def counted(con, parts):
+        calls.append(parts)
+        return source(con, parts)
+
+    monkeypatch.setattr(pb, "source", counted)
+    with Results(path) as r:
+        if kind == "identical":
+            page = workspace.workspace_data(r, [PID], max_ligands=1)
+            assert page["proteins"][0]["rows"][0]["pb"] == dict(
+                status="valid", valid=True, passed=0, total=0, failed=[])
+        else:
+            with pytest.raises(pb.PoseBustersIntegrityError):
+                workspace.workspace_data(r, [PID], max_ligands=1)
+        assert len(calls) == 1 and calls[0] == [(PID, str(part))]
