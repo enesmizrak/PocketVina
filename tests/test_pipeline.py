@@ -2077,19 +2077,21 @@ def test_receptor_model_atlas_rejects_before_external_launch(tmp_path, example_d
 
 @pytest.mark.parametrize("compressed", [False, True])
 @pytest.mark.parametrize("legacy", [False, True])
-def test_receptor_model_pdbqt_real_child_preserves_other_records(tmp_path, compressed, legacy):
-    atoms = b"".join(FIXTURE_RECEPTOR.read_bytes().splitlines(True)[:2]).replace(b"\n", b"\r\n")
-    implicit = b"REMARK keep spacing  and order\r\n" + atoms + b"TER\r\n"
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n", b"\r"], ids=["lf", "crlf", "cr"])
+def test_receptor_model_pdbqt_real_child_preserves_other_records(tmp_path, compressed, legacy, newline):
+    atoms = FIXTURE_RECEPTOR.read_bytes().splitlines()[:2]
+    expected = b"REMARK keep spacing  and order\n" + atoms[0] + b"\n\n" + atoms[1] + b"\nTER\n"
+    implicit = expected.replace(b"\n", newline)
     source = tmp_path / ("receptor.pdbqt.gz" if compressed else "receptor.pdbqt")
     dest = tmp_path / "child.pdbqt"
-    for raw in (implicit, b"MODEL        1\r\n" + implicit + b"ENDMDL\r\n"):
+    for raw in (implicit, b"MODEL        1" + newline + implicit + b"ENDMDL" + newline):
         original = gzip.compress(raw) if compressed else raw
         source.write_bytes(original)
-        assert pipeline.receptor_pdbqt(source, legacy=legacy).encode() == implicit
+        assert pipeline.receptor_pdbqt(source, legacy=legacy).encode() == expected
         proc = subprocess.run([sys.executable, "-c", pipeline._RECEPTOR_CODE, str(source), str(dest),
                                "legacy" if legacy else "rigid"], capture_output=True, text=True)
         assert proc.returncode == 0, proc.stdout + proc.stderr
-        assert dest.read_bytes() == implicit
+        assert dest.read_bytes() == expected
         assert source.read_bytes() == original
 
 
@@ -2156,20 +2158,26 @@ def test_receptor_model_accepted_preparation_and_results_equivalent(tmp_path, ex
     ("atlas", False), ("direct", False), ("direct_cached", False), ("database", False),
     ("direct_cached", True), ("database", True),
 ])
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n", b"\r"], ids=["lf", "crlf", "cr"])
 def test_receptor_model_pdbqt_engine_handoff(tmp_path, example_dir, fake_engine_env, monkeypatch,
-                                           workflow, engine_failure):
+                                           workflow, engine_failure, newline):
     from test_gpu import wrapper_engine
 
-    atoms = b"".join(FIXTURE_RECEPTOR.read_bytes().splitlines(True)[:2]).replace(b"\n", b"\r\n")
-    implicit = b"REMARK preserve this record\r\n" + atoms + b"TER\r\n"
+    atoms = FIXTURE_RECEPTOR.read_bytes().splitlines()[:2]
+    implicit_lf = b"REMARK preserve this record\n" + atoms[0] + b"\n\n" + atoms[1] + b"\nTER\n"
+    implicit = implicit_lf.replace(b"\n", newline)
     expected = tmp_path / "expected.pdbqt"
-    expected.write_bytes(implicit)
+    expected.write_bytes(implicit_lf)
     observations = tmp_path / "engine_receptors.jsonl"
     body = ("import json\nfrom pathlib import Path\n"
             "options = dict(line.split('=', 1) for line in config.splitlines() if '=' in line)\n"
             "receptor = Path(options['receptor '].strip())\n"
             "raw = receptor.read_bytes()\n"
             "assert not any(line[:6].strip() in (b'MODEL', b'ENDMDL') for line in raw.splitlines())\n"
+            # Model native std::getline dispatch: a CR-only blank record is not an empty record.
+            "assert all(not line or line.startswith((b'TER', b'WARNING', b'REMARK', b'ATOM  ', b'HETATM')) "
+            "for line in raw.split(b'\\n'))\n"
+            "assert b'\\r' not in raw and b'\\n\\n' in raw\n"
             f"assert raw == Path({str(expected)!r}).read_bytes()\n"
             f"with open({str(observations)!r}, 'a') as stream:\n"
             "    stream.write(json.dumps(str(receptor)) + '\\n')\n")
@@ -2190,7 +2198,8 @@ def test_receptor_model_pdbqt_engine_handoff(tmp_path, example_dir, fake_engine_
         source = tmp_path / "receptor.pdbqt"
     plist, smiles = make_inputs(tmp_path, example_dir, ligands=("molecule1",), proteins=[source])
     frames = []
-    for mode, raw in (("implicit", implicit), ("explicit", b"MODEL        7\r\n" + implicit + b"ENDMDL\r\n")):
+    for mode, raw in (("implicit", implicit),
+                      ("explicit", b"MODEL        7" + newline + implicit + b"ENDMDL" + newline)):
         source.write_bytes(raw)
         out = tmp_path / mode
         settings = dict(smiles_file=str(smiles), output_dir=str(out), tmp_dir=str(tmp_path / "tmp"),
@@ -2214,13 +2223,18 @@ def test_receptor_model_pdbqt_engine_handoff(tmp_path, example_dir, fake_engine_
         assert os.listdir(settings["tmp_dir"]) == []
         if workflow == "direct_cached":
             assert cached.read_bytes() == raw
-        if mode == "explicit" and workflow in ("direct_cached", "database"):
-            assert all(within(path, settings["tmp_dir"]) and not path.exists() for path in seen)
+        if workflow in ("direct_cached", "database"):
+            if mode == "explicit" or newline != b"\n":
+                assert all(within(path, settings["tmp_dir"]) and not path.exists() for path in seen)
+            else:
+                assert all(path == (cached if workflow == "direct_cached" else source) for path in seen)
         if workflow == "atlas":
             assert pv.failed_proteins == {}
             saved = json.loads((out / "manifest" / "receptor.json").read_text())
             assert saved["summary"]["input_identity"]["structure_sha256"] == hashlib.sha256(raw).hexdigest()
             assert gzip.decompress((out / "structures" / "receptor.pdbqt.gz").read_bytes()) == raw
+            protein = read_table(out / "tables" / "proteins" / "receptor.parquet").iloc[0]
+            assert protein.receptor_sha256 == hashlib.sha256(implicit_lf).digest()
             with Results(out) as results:
                 frames.append(results.best_scores())
         else:
@@ -2270,7 +2284,7 @@ def test_receptor_pdbqt_matches_obabel_cli(tmp_path, example_dir):
             source.write_bytes(gzip.compress(data) if compressed else data)
             before = source.read_bytes()
             for flag, expected in ((False, text), (True, legacy)):
-                wanted = content.replace("\n", "\r\n") if suffix == ".pdbqt" else expected
+                wanted = content if suffix == ".pdbqt" else expected
                 assert pipeline.receptor_pdbqt(source, legacy=flag) == wanted
                 dest = tmp_path / "explicit_child.pdbqt"
                 assert pipeline._receptor_pdbqt(str(source), str(dest), lambda: None, legacy=flag) == wanted.encode()

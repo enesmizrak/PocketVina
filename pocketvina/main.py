@@ -139,8 +139,9 @@ def validate_receptor_structure(structure) -> None:
         _validate_receptor_models(read_structure(structure)[1], structure)
 
 
-def _without_receptor_model_markers(text: str) -> str:
-    """Remove only the wrappers of a validated single model; the rigid engine parser rejects MODEL tags."""
+def _normalize_receptor_pdbqt(text: str) -> str:
+    """LF newlines and no wrappers for a validated single model, as required by the rigid engine parser."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     return "".join(line for line in text.splitlines(True) if line[:6].strip() not in ("MODEL", "ENDMDL"))
 
 
@@ -151,14 +152,14 @@ def receptor_pdbqt(structure, legacy: bool = False) -> str:
     The receptor is rigid, so it is written as one (``obabel -xr``): the same atoms, types, charges and coordinates
     as before, in input order, in well under a second; ``legacy=True`` writes the pre-v0.2 output (atoms in the order
     of OpenBabel's torsion tree, byte-identical to ``obabel cleaned.pdb -O x.pdbqt``), which takes tens of seconds for
-    a large protein. mmCIF is first converted to PDB by OpenBabel. PDBQT records are preserved, except that the
-    MODEL/ENDMDL wrappers of a validated single model are removed for the rigid receptor parser.
+    a large protein. mmCIF is first converted to PDB by OpenBabel. PDBQT atom content and order are preserved,
+    with universal LF newlines and the MODEL/ENDMDL wrappers of a validated single model removed for the engine.
     """
-    kind, text = read_structure(structure, preserve_newlines=structure_kind(structure)[0] == "pdbqt")
+    kind, text = read_structure(structure)
     if kind != "cif":
         _validate_receptor_models(text, structure)
     if kind == "pdbqt":
-        return _without_receptor_model_markers(text)
+        return _normalize_receptor_pdbqt(text)
     if kind == "cif":
         text = pybel.readstring("mmcif", text).write("pdb")
         _validate_receptor_models(text, structure)
@@ -1222,7 +1223,7 @@ class PocketVinaGPU:
             if structure_kind(protein_file)[0] == "pdbqt":
                 _, text = read_structure(protein_file, preserve_newlines=True)
                 _validate_receptor_models(text, protein_file)
-                normalized = _without_receptor_model_markers(text)
+                normalized = _normalize_receptor_pdbqt(text)
                 if normalized != text:
                     normalized_dir = tempfile.mkdtemp(prefix="receptor-", dir=cwd)
                     # Keep the basename: the engine uses it for output filenames and protein names.
