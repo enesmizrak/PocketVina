@@ -8,6 +8,7 @@ import sys
 import logging
 import numbers
 import subprocess
+import tempfile
 from tqdm import tqdm
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -94,14 +95,15 @@ def structure_kind(path) -> Tuple[str, bool]:
     return STRUCTURE_KINDS.get(os.path.splitext(name)[1], "pdb"), gz
 
 
-def read_structure(path) -> Tuple[str, str]:
-    """(kind, text) of a structure file, gunzipped, with universal newlines (as a text-mode ``open``)."""
+def read_structure(path, *, preserve_newlines: bool = False) -> Tuple[str, str]:
+    """(kind, text) of a structure file, gunzipped; universal newlines unless preservation is requested."""
     kind, gz = structure_kind(path)
     with open(path, "rb") as f:
         data = f.read()
     if gz:
         data = gzip.decompress(data)
-    return kind, data.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+    text = data.decode("utf-8", "replace")
+    return kind, text if preserve_newlines else text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _validate_receptor_models(text: str, structure) -> None:
@@ -137,6 +139,11 @@ def validate_receptor_structure(structure) -> None:
         _validate_receptor_models(read_structure(structure)[1], structure)
 
 
+def _without_receptor_model_markers(text: str) -> str:
+    """Remove only the wrappers of a validated single model; the rigid engine parser rejects MODEL tags."""
+    return "".join(line for line in text.splitlines(True) if line[:6].strip() not in ("MODEL", "ENDMDL"))
+
+
 def receptor_pdbqt(structure, legacy: bool = False) -> str:
     """Receptor PDBQT text for the engine, made from a PDB, mmCIF or PDBQT file (optionally gzipped).
 
@@ -144,13 +151,14 @@ def receptor_pdbqt(structure, legacy: bool = False) -> str:
     The receptor is rigid, so it is written as one (``obabel -xr``): the same atoms, types, charges and coordinates
     as before, in input order, in well under a second; ``legacy=True`` writes the pre-v0.2 output (atoms in the order
     of OpenBabel's torsion tree, byte-identical to ``obabel cleaned.pdb -O x.pdbqt``), which takes tens of seconds for
-    a large protein. mmCIF is first converted to PDB by OpenBabel; a PDBQT file is used as it is.
+    a large protein. mmCIF is first converted to PDB by OpenBabel. PDBQT records are preserved, except that the
+    MODEL/ENDMDL wrappers of a validated single model are removed for the rigid receptor parser.
     """
-    kind, text = read_structure(structure)
+    kind, text = read_structure(structure, preserve_newlines=structure_kind(structure)[0] == "pdbqt")
     if kind != "cif":
         _validate_receptor_models(text, structure)
     if kind == "pdbqt":
-        return text
+        return _without_receptor_model_markers(text)
     if kind == "cif":
         text = pybel.readstring("mmcif", text).write("pdb")
         _validate_receptor_models(text, structure)
@@ -1209,7 +1217,18 @@ class PocketVinaGPU:
         if own_cwd:
             cwd = engine.resolve_tmp_dir(self.config.tmp_dir)
 
+        normalized_dir = None
         try:
+            if structure_kind(protein_file)[0] == "pdbqt":
+                _, text = read_structure(protein_file, preserve_newlines=True)
+                _validate_receptor_models(text, protein_file)
+                normalized = _without_receptor_model_markers(text)
+                if normalized != text:
+                    normalized_dir = tempfile.mkdtemp(prefix="receptor-", dir=cwd)
+                    # Keep the basename: the engine uses it for output filenames and protein names.
+                    protein_file = os.path.join(normalized_dir, os.path.basename(protein_file))
+                    with open(protein_file, "w", encoding="utf-8", newline="") as stream:
+                        stream.write(normalized)
             for pocket in pockets_to_process:
                 for folder, batch_num in batch_folders:
                     try:
@@ -1238,6 +1257,8 @@ class PocketVinaGPU:
                     except Exception as e:
                         self.logger.error(f"Error in docking: {e}")
         finally:
+            if normalized_dir is not None:
+                shutil.rmtree(normalized_dir, ignore_errors=True)
             if own_cwd:
                 shutil.rmtree(cwd, ignore_errors=True)
 

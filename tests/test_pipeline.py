@@ -2075,6 +2075,24 @@ def test_receptor_model_atlas_rejects_before_external_launch(tmp_path, example_d
     assert list(Path(cfg.tmp_dir).iterdir()) == []
 
 
+@pytest.mark.parametrize("compressed", [False, True])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_receptor_model_pdbqt_real_child_preserves_other_records(tmp_path, compressed, legacy):
+    atoms = b"".join(FIXTURE_RECEPTOR.read_bytes().splitlines(True)[:2]).replace(b"\n", b"\r\n")
+    implicit = b"REMARK keep spacing  and order\r\n" + atoms + b"TER\r\n"
+    source = tmp_path / ("receptor.pdbqt.gz" if compressed else "receptor.pdbqt")
+    dest = tmp_path / "child.pdbqt"
+    for raw in (implicit, b"MODEL        1\r\n" + implicit + b"ENDMDL\r\n"):
+        original = gzip.compress(raw) if compressed else raw
+        source.write_bytes(original)
+        assert pipeline.receptor_pdbqt(source, legacy=legacy).encode() == implicit
+        proc = subprocess.run([sys.executable, "-c", pipeline._RECEPTOR_CODE, str(source), str(dest),
+                               "legacy" if legacy else "rigid"], capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert dest.read_bytes() == implicit
+        assert source.read_bytes() == original
+
+
 @pytest.mark.parametrize("legacy", [False, True])
 def test_receptor_model_completed_id_cannot_reuse_ensemble(input_identity_run, fake_engine_env,
                                                          monkeypatch, legacy):
@@ -2104,19 +2122,26 @@ def test_receptor_model_completed_id_cannot_reuse_ensemble(input_identity_run, f
         assert len(res.best_scores()) == 1
 
 
+@pytest.mark.parametrize("suffix", [".pdb", ".pdbqt"])
 def test_receptor_model_accepted_preparation_and_results_equivalent(tmp_path, example_dir, fake_engine_env,
-                                                                 monkeypatch):
+                                                                 monkeypatch, suffix):
     monkeypatch.setattr(pipeline, "predict_pockets", stub_predict_pockets(1))
-    source = crop_pdb(example_dir / "proteins" / "1fbl.pdb", tmp_path / "receptor.pdb")
+    source = tmp_path / ("receptor" + suffix)
+    if suffix == ".pdb":
+        crop_pdb(example_dir / "proteins" / "1fbl.pdb", source)
+    else:
+        source.write_bytes(FIXTURE_RECEPTOR.read_bytes())
     original = source.read_text()
     plist, smiles = make_inputs(tmp_path, example_dir, ligands=("molecule1",), proteins=[source])
     observed = []
     for name, content in (("implicit", original), ("explicit", "MODEL        1\n" + original + "ENDMDL\n")):
         source.write_text(content)
+        before = source.read_bytes()
         cfg = atlas_config(plist, smiles, tmp_path / name, tmp_path / "tmp", seed=42, top_pockets=1)
         pv = PocketVinaGPU(cfg)
         pipeline.run_atlas(pv)
         assert pv.failed_proteins == {}
+        assert source.read_bytes() == before
         saved = json.loads((Path(cfg.output_dir) / "manifest" / "receptor.json").read_text())
         with Results(cfg.output_dir) as res:
             observed.append((saved["summary"]["input_identity"]["structure_sha256"],
@@ -2125,6 +2150,84 @@ def test_receptor_model_accepted_preparation_and_results_equivalent(tmp_path, ex
     assert observed[0][0] != observed[1][0]  # Provenance continues to identify the original source bytes.
     assert observed[0][1] == observed[1][1]
     pd.testing.assert_frame_equal(observed[0][2], observed[1][2])
+
+
+@pytest.mark.parametrize("workflow,engine_failure", [
+    ("atlas", False), ("direct", False), ("direct_cached", False), ("database", False),
+    ("direct_cached", True), ("database", True),
+])
+def test_receptor_model_pdbqt_engine_handoff(tmp_path, example_dir, fake_engine_env, monkeypatch,
+                                           workflow, engine_failure):
+    from test_gpu import wrapper_engine
+
+    atoms = b"".join(FIXTURE_RECEPTOR.read_bytes().splitlines(True)[:2]).replace(b"\n", b"\r\n")
+    implicit = b"REMARK preserve this record\r\n" + atoms + b"TER\r\n"
+    expected = tmp_path / "expected.pdbqt"
+    expected.write_bytes(implicit)
+    observations = tmp_path / "engine_receptors.jsonl"
+    body = ("import json\nfrom pathlib import Path\n"
+            "options = dict(line.split('=', 1) for line in config.splitlines() if '=' in line)\n"
+            "receptor = Path(options['receptor '].strip())\n"
+            "raw = receptor.read_bytes()\n"
+            "assert not any(line[:6].strip() in (b'MODEL', b'ENDMDL') for line in raw.splitlines())\n"
+            f"assert raw == Path({str(expected)!r}).read_bytes()\n"
+            f"with open({str(observations)!r}, 'a') as stream:\n"
+            "    stream.write(json.dumps(str(receptor)) + '\\n')\n")
+    if engine_failure:
+        body += "sys.exit(1)\n"
+    monkeypatch.setenv("POCKETVINA_ENGINE", str(wrapper_engine(tmp_path, fake_engine_env, body)))
+    monkeypatch.setattr(pipeline, "predict_pockets", stub_predict_pockets(1))
+
+    def pockets_only(self, path):
+        write_pockets(Path(self.pockets_dir) / f"{Path(path).stem}.csv", 1)
+        return True
+
+    monkeypatch.setattr(P2RankProcessor, "run_p2rank", pockets_only)
+    if workflow == "database":
+        db, protein_list = make_database(tmp_path)
+        source = db / "AF_conservation" / "structures" / "AF-Q96LA5-F1-model_v1_filtered.pdbqt"
+    else:
+        source = tmp_path / "receptor.pdbqt"
+    plist, smiles = make_inputs(tmp_path, example_dir, ligands=("molecule1",), proteins=[source])
+    frames = []
+    for mode, raw in (("implicit", implicit), ("explicit", b"MODEL        7\r\n" + implicit + b"ENDMDL\r\n")):
+        source.write_bytes(raw)
+        out = tmp_path / mode
+        settings = dict(smiles_file=str(smiles), output_dir=str(out), tmp_dir=str(tmp_path / "tmp"),
+                        top_pockets=1, seed=42)
+        if workflow == "database":
+            settings.update(database_path=str(db), protein_list=str(protein_list))
+        else:
+            settings.update(protein_paths=str(plist), output_format="atlas" if workflow == "atlas" else "files")
+        cached = out / "proteins" / "structures" / source.name
+        if workflow == "direct_cached":
+            cached.parent.mkdir(parents=True)
+            cached.write_bytes(raw)
+            (out / "proteins" / "pockets").mkdir()
+            write_pockets(out / "proteins" / "pockets" / "receptor.csv", 1)
+        before_observations = observations.read_text().splitlines() if observations.exists() else []
+        pv = PocketVinaGPU(PocketVinaConfig(**settings))
+        pv.execute_docking()
+        seen = [Path(json.loads(line)) for line in observations.read_text().splitlines()[len(before_observations):]]
+        assert seen and all(path.name == source.name for path in seen)
+        assert source.read_bytes() == raw
+        assert os.listdir(settings["tmp_dir"]) == []
+        if workflow == "direct_cached":
+            assert cached.read_bytes() == raw
+        if mode == "explicit" and workflow in ("direct_cached", "database"):
+            assert all(within(path, settings["tmp_dir"]) and not path.exists() for path in seen)
+        if workflow == "atlas":
+            assert pv.failed_proteins == {}
+            saved = json.loads((out / "manifest" / "receptor.json").read_text())
+            assert saved["summary"]["input_identity"]["structure_sha256"] == hashlib.sha256(raw).hexdigest()
+            assert gzip.decompress((out / "structures" / "receptor.pdbqt.gz").read_bytes()) == raw
+            with Results(out) as results:
+                frames.append(results.best_scores())
+        else:
+            frame = pd.read_csv(out / "combined_results.csv")
+            assert frame.empty == engine_failure
+            frames.append(frame)
+    pd.testing.assert_frame_equal(frames[0], frames[1])
 
 
 def test_receptor_pdbqt_matches_obabel_cli(tmp_path, example_dir):
@@ -2165,11 +2268,13 @@ def test_receptor_pdbqt_matches_obabel_cli(tmp_path, example_dir):
             source = tmp_path / ("explicit" + suffix + (".gz" if compressed else ""))
             data = explicit.replace("\n", "\r\n").encode()
             source.write_bytes(gzip.compress(data) if compressed else data)
+            before = source.read_bytes()
             for flag, expected in ((False, text), (True, legacy)):
-                wanted = explicit if suffix == ".pdbqt" else expected
+                wanted = content.replace("\n", "\r\n") if suffix == ".pdbqt" else expected
                 assert pipeline.receptor_pdbqt(source, legacy=flag) == wanted
                 dest = tmp_path / "explicit_child.pdbqt"
                 assert pipeline._receptor_pdbqt(str(source), str(dest), lambda: None, legacy=flag) == wanted.encode()
+            assert source.read_bytes() == before
 
 
 def test_receptor_pdbqt_from_mmcif(tmp_path, example_dir):

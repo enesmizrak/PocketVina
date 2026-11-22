@@ -30,6 +30,11 @@ outside an explicit model are rejected before pocket prediction, conversion or c
 Extract the one receptor model you intend to dock into a separate file and use that file as input. PocketVina
 does not choose the first model or dock an ensemble. Stored results can still be read without preparing inputs.
 
+The engine cannot read `MODEL`/`ENDMDL` tags in a receptor. For a validated explicit single-model PDBQT, PocketVina
+removes only those wrappers from its engine input, preserving all other records, atom order and line endings.
+Your source file and its input fingerprint stay unchanged. Legacy cached and database PDBQTs use a temporary
+normalized copy with the same basename when needed; that copy is removed after docking.
+
 The check uses PDB/PDBQT model boundaries; it does not resolve mmCIF ensemble selection. mmCIF still follows
 OpenBabel's parser behavior, with a boundary check on any markers retained in converted PDB output.
 

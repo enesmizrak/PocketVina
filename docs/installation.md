@@ -86,6 +86,12 @@ Multiple models are rejected even if their model labels repeat. Unclosed, nested
 atom records outside an explicit model are also rejected. Extract one receptor model into a separate input file
 before running PocketVina; no model is selected automatically.
 
+For a validated explicit single-model PDBQT, PocketVina removes only the `MODEL`/`ENDMDL` wrappers from the
+receptor passed to the engine, which cannot read those tags. All other records, atom order and line endings are
+preserved. An implicit single-model PDBQT passes through unchanged. Original inputs and their source fingerprints
+retain the wrappers; cached or database receptors that need normalization use a private temporary copy with the
+same basename, removed after docking.
+
 This check runs before pocket prediction, receptor conversion and reuse of completed proteins with readable
 PDB/PDBQT sources, in both atlas and legacy files workflows. Existing results remain readable.
 
