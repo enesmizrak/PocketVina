@@ -248,6 +248,37 @@ def test_dock_input_identity_rejects_changed_structure(tmp_path, example_dir, fa
     assert len(fake_engine_env.calls()) == n_calls and manifest.read_bytes() == before
 
 
+@pytest.mark.parametrize("output_format", ["atlas", "files"])
+def test_dock_receptor_model_rejected_before_external_launch(tmp_path, example_dir, fake_engine_env,
+                                                          monkeypatch, caplog, output_format):
+    source = tmp_path / "ensemble.pdb"
+    atom = FIXTURE_RECEPTOR.read_text().splitlines(True)[0]
+    source.write_text(f"MODEL        1\n{atom}ENDMDL\nMODEL        2\n{atom}ENDMDL\n")
+    plist, smiles = inputs(tmp_path, example_dir, proteins=[source], ligands=LIGANDS[:1])
+    out = tmp_path / "results"
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("rejected receptor reached prediction or conversion")
+
+    real_readstring = pv_main.pybel.readstring
+
+    def receptor_tripwire(format, *args, **kwargs):
+        if format in ("pdb", "mmcif"):
+            forbidden()
+        return real_readstring(format, *args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "predict_pockets", forbidden)
+    monkeypatch.setattr(pv_main.p2rank, "ensure_p2rank", forbidden)
+    monkeypatch.setattr(pv_main.pybel, "readstring", receptor_tripwire)
+    result = invoke("dock", "--proteins", plist, "--ligands", smiles, "--out", out,
+                    "--format", output_format, "--tmp-dir", tmp_path / "tmp")
+    assert "extract one receptor model" in result.output + caplog.text
+    assert fake_engine_env.calls() == []
+    if output_format == "atlas":
+        assert result.exit_code == cli.EXIT_NOTHING
+    assert not list((tmp_path / "tmp").iterdir())
+
+
 def test_dock_ligands_per_call_zero_docks_all_ligands_of_a_pocket_in_one_call(tmp_path, example_dir,
                                                                                fake_engine_env, stubs):
     """--ligands-per-call 0 = all ligands of a pocket in one engine call (main.ligand_chunk_size), as in Python."""

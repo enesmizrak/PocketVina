@@ -2005,6 +2005,128 @@ def crop_pdb(src, dst, n_atoms=CROP_ATOMS):
     return dst
 
 
+@pytest.mark.parametrize("suffix", [".pdb", ".pdbqt", ".pdb.gz", ".pdbqt.gz"])
+@pytest.mark.parametrize("boundaries", [
+    "MODEL        1\n{a}ENDMDL\nMODEL        2\n{b}ENDMDL\n",
+    "MODEL        1\n{a}ENDMDL\nMODEL        1\n{b}ENDMDL\n",
+    "MODEL        1\n{a}",
+    "MODEL        1\n{a}MODEL        2\n{b}ENDMDL\nENDMDL\n",
+    "{a}ENDMDL\n",
+    "{a}MODEL        1\n{b}ENDMDL\n",
+    "MODEL        1\n{a}ENDMDL\n{b}",
+    "MODEL\n{a}ENDMDL\n",
+    "MODEL      bad\n{a}ENDMDL\n",
+    "MODEL        1\n{a}ENDMDL extra\n",
+])
+def test_receptor_model_rejects_ambiguous_boundaries(tmp_path, suffix, boundaries, monkeypatch):
+    a, b = FIXTURE_RECEPTOR.read_text().splitlines(True)[:2]
+    b = b[:30] + " 999.000" + b[38:]  # The second alternative has distinct coordinates.
+    text = boundaries.format(a=a, b=b).replace("\n", "\r\n")
+    source = tmp_path / ("receptor" + suffix)
+    source.write_bytes(gzip.compress(text.encode()) if suffix.endswith(".gz") else text.encode())
+
+    def unexpected_conversion(*args, **kwargs):
+        pytest.fail("rejected receptor reached OpenBabel")
+
+    monkeypatch.setattr(pv_main.pybel, "readstring", unexpected_conversion)
+    with pytest.raises(ValueError, match="extract one receptor model"):
+        pipeline.receptor_pdbqt(source)
+
+
+@pytest.mark.parametrize("suffix", [".pdb", ".pdb.gz", ".pdbqt", ".pdbqt.gz"])
+def test_receptor_model_child_rejects_before_conversion(tmp_path, suffix, monkeypatch):
+    atom = FIXTURE_RECEPTOR.read_text().splitlines(True)[0]
+    text = f"MODEL        1\n{atom}ENDMDL\nMODEL        2\n{atom}ENDMDL\n"
+    source = tmp_path / ("receptor" + suffix)
+    source.write_bytes(gzip.compress(text.encode()) if suffix.endswith(".gz") else text.encode())
+    # A real child imports this tripwire before attempting receptor conversion.
+    monkeypatch.setattr(pipeline, "_RECEPTOR_CODE", "from pocketvina import main\n"
+                        "def forbidden(*args, **kwargs):\n    raise AssertionError('OpenBabel launched')\n"
+                        "main.pybel.readstring = forbidden\n" + pipeline._RECEPTOR_CODE)
+    dest = tmp_path / "out.pdbqt"
+    with pytest.raises(ValueError, match="extract one receptor model"):
+        pipeline._receptor_pdbqt(str(source), str(dest), lambda: None)
+    assert not dest.exists()
+
+
+@pytest.mark.parametrize("supplied", [False, True])
+def test_receptor_model_atlas_rejects_before_external_launch(tmp_path, example_dir, fake_engine_env,
+                                                           monkeypatch, supplied):
+    source = tmp_path / "ensemble.pdbqt"
+    atom = FIXTURE_RECEPTOR.read_text().splitlines(True)[0]
+    source.write_text(f"MODEL        1\n{atom}ENDMDL\nMODEL        2\n{atom}ENDMDL\n")
+    plist, smiles = make_inputs(tmp_path, example_dir, ligands=("molecule1",), proteins=[source])
+    cfg = atlas_config(plist, smiles, tmp_path / "results", tmp_path / "tmp")
+    if supplied:
+        cfg.pockets_dir = str(tmp_path / "pockets")
+        Path(cfg.pockets_dir).mkdir()
+        write_pockets(Path(cfg.pockets_dir) / "ensemble.csv", 1)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("rejected receptor reached prediction or conversion")
+
+    monkeypatch.setattr(pipeline, "predict_pockets", forbidden)
+    monkeypatch.setattr(pipeline, "_receptor_pdbqt", forbidden)
+    pv = PocketVinaGPU(cfg)
+    pipeline.run_atlas(pv)
+    assert "extract one receptor model" in pv.failed_proteins["ensemble"]
+    assert fake_engine_env.calls() == []
+    assert ResultsDir(cfg.output_dir).done_proteins() == set()
+    assert list(Path(cfg.tmp_dir).iterdir()) == []
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_receptor_model_completed_id_cannot_reuse_ensemble(input_identity_run, fake_engine_env,
+                                                         monkeypatch, legacy):
+    cfg, source, _ = input_identity_run
+    out = Path(cfg.output_dir)
+    manifest = out / "manifest" / f"{source.stem}.json"
+    if legacy:
+        saved = json.loads(manifest.read_text())
+        del saved["summary"]["input_identity"]
+        manifest.write_text(json.dumps(saved))
+    source.write_text("MODEL        1\n" + source.read_text() + "ENDMDL\nMODEL        1\nENDMDL\n")
+    before = {f: (out / f).read_bytes() for f in results_files(out)}
+    calls = len(fake_engine_env.calls())
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("completed ensemble reached prediction or conversion")
+
+    monkeypatch.setattr(pipeline, "predict_pockets", forbidden)
+    monkeypatch.setattr(pipeline, "_receptor_pdbqt", forbidden)
+    with pytest.raises(pipeline.RunAborted, match="extract one receptor model"):
+        pipeline.run_atlas(cfg, force=True)
+    assert len(fake_engine_env.calls()) == calls
+    assert {f: (out / f).read_bytes() for f in results_files(out)} == before
+    assert os.listdir(cfg.tmp_dir) == []
+    with Results(out) as res:
+        assert res.proteins() == [source.stem]
+        assert len(res.best_scores()) == 1
+
+
+def test_receptor_model_accepted_preparation_and_results_equivalent(tmp_path, example_dir, fake_engine_env,
+                                                                 monkeypatch):
+    monkeypatch.setattr(pipeline, "predict_pockets", stub_predict_pockets(1))
+    source = crop_pdb(example_dir / "proteins" / "1fbl.pdb", tmp_path / "receptor.pdb")
+    original = source.read_text()
+    plist, smiles = make_inputs(tmp_path, example_dir, ligands=("molecule1",), proteins=[source])
+    observed = []
+    for name, content in (("implicit", original), ("explicit", "MODEL        1\n" + original + "ENDMDL\n")):
+        source.write_text(content)
+        cfg = atlas_config(plist, smiles, tmp_path / name, tmp_path / "tmp", seed=42, top_pockets=1)
+        pv = PocketVinaGPU(cfg)
+        pipeline.run_atlas(pv)
+        assert pv.failed_proteins == {}
+        saved = json.loads((Path(cfg.output_dir) / "manifest" / "receptor.json").read_text())
+        with Results(cfg.output_dir) as res:
+            observed.append((saved["summary"]["input_identity"]["structure_sha256"],
+                             read_table(Path(cfg.output_dir) / "tables" / "proteins" / "receptor.parquet")
+                             .iloc[0].receptor_sha256, res.best_scores()))
+    assert observed[0][0] != observed[1][0]  # Provenance continues to identify the original source bytes.
+    assert observed[0][1] == observed[1][1]
+    pd.testing.assert_frame_equal(observed[0][2], observed[1][2])
+
+
 def test_receptor_pdbqt_matches_obabel_cli(tmp_path, example_dir):
     """Same text as ``obabel x.pdb -xr -O x.pdbqt`` (rigid) on the cleaned PDB, ATOM lines kept; ``legacy=True``: the
     pre-v0.2 ``obabel x.pdb -O x.pdbqt``, the same atom lines in another order."""
@@ -2037,6 +2159,17 @@ def test_receptor_pdbqt_matches_obabel_cli(tmp_path, example_dir):
     crlf.write_bytes(pdb.read_bytes().replace(b"\n", b"\r\n"))
     assert pipeline.receptor_pdbqt(crlf) == text
     assert pipeline.receptor_pdbqt(FIXTURE_RECEPTOR) == FIXTURE_RECEPTOR.read_text()  # PDBQT: as it is
+    for suffix, content in ((".pdb", pdb.read_text()), (".pdbqt", text)):
+        explicit = "MODEL        7\n" + content + "ENDMDL\n"
+        for compressed in (False, True):
+            source = tmp_path / ("explicit" + suffix + (".gz" if compressed else ""))
+            data = explicit.replace("\n", "\r\n").encode()
+            source.write_bytes(gzip.compress(data) if compressed else data)
+            for flag, expected in ((False, text), (True, legacy)):
+                wanted = explicit if suffix == ".pdbqt" else expected
+                assert pipeline.receptor_pdbqt(source, legacy=flag) == wanted
+                dest = tmp_path / "explicit_child.pdbqt"
+                assert pipeline._receptor_pdbqt(str(source), str(dest), lambda: None, legacy=flag) == wanted.encode()
 
 
 def test_receptor_pdbqt_from_mmcif(tmp_path, example_dir):

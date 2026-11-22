@@ -104,6 +104,39 @@ def read_structure(path) -> Tuple[str, str]:
     return kind, data.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
 
 
+def _validate_receptor_models(text: str, structure) -> None:
+    """Reject alternative or ambiguous PDB/PDBQT model boundaries without changing atom records."""
+    models = 0
+    inside = outside_atoms = False
+    for line in text.splitlines():
+        record = line[:6].strip()
+        if record == "MODEL":
+            label = line[6:].strip()
+            if models or outside_atoms or not label.isdecimal():
+                break
+            models += 1
+            inside = True
+        elif record == "ENDMDL":
+            if not inside or line[6:].strip():
+                break
+            inside = False
+        elif line.startswith(("ATOM", "HETATM")) and not inside:
+            if models:
+                break
+            outside_atoms = True
+    else:
+        if not inside:
+            return
+    raise ValueError(f"{structure}: multiple or ambiguous receptor models; extract one receptor model first "
+                     "as a PDB/PDBQT with no model markers or one matched MODEL/ENDMDL pair")
+
+
+def validate_receptor_structure(structure) -> None:
+    """Validate source PDB/PDBQT model boundaries before prediction, conversion or reuse."""
+    if structure_kind(structure)[0] in ("pdb", "pdbqt"):
+        _validate_receptor_models(read_structure(structure)[1], structure)
+
+
 def receptor_pdbqt(structure, legacy: bool = False) -> str:
     """Receptor PDBQT text for the engine, made from a PDB, mmCIF or PDBQT file (optionally gzipped).
 
@@ -114,10 +147,13 @@ def receptor_pdbqt(structure, legacy: bool = False) -> str:
     a large protein. mmCIF is first converted to PDB by OpenBabel; a PDBQT file is used as it is.
     """
     kind, text = read_structure(structure)
+    if kind != "cif":
+        _validate_receptor_models(text, structure)
     if kind == "pdbqt":
         return text
     if kind == "cif":
         text = pybel.readstring("mmcif", text).write("pdb")
+        _validate_receptor_models(text, structure)
     cleaned = "".join(line for line in text.splitlines(True)
                       if line.startswith(("ATOM", "HETATM")) and "HOH" not in line)
     if not cleaned:
@@ -466,6 +502,7 @@ class P2RankProcessor:
         self.logger.info(f"Running P2Rank on {pdb_file}")
 
         try:
+            validate_receptor_structure(pdb_file)
             # Run P2Rank ($P2RANK_HOME, prank on PATH, p2rank_2.5 in the package or the user cache, downloaded there
             # once if there is none; see pocketvina.p2rank)
             result = subprocess.run([
@@ -544,6 +581,12 @@ class P2RankProcessor:
 
             # Process each file
             for pdb_file in pdb_files:
+                try:
+                    validate_receptor_structure(pdb_file)
+                except (OSError, ValueError) as e:
+                    self.logger.error(f"Error processing receptor {pdb_file}: {e}")
+                    results[pdb_file] = False
+                    continue
                 base_name = os.path.splitext(os.path.basename(pdb_file))[0]
                 pdbqt_file = os.path.join(self.structures_dir, f"{base_name}.pdbqt")
                 pockets_csv = os.path.join(self.pockets_dir, f"{base_name}.csv")
@@ -668,6 +711,11 @@ class PocketVinaGPU:
         protein_paths = read_protein_list(self.config.protein_paths)
 
         for protein_path in protein_paths:
+            try:
+                validate_receptor_structure(protein_path)
+            except (OSError, ValueError) as e:
+                self.logger.error(f"Error processing receptor {protein_path}: {e}")
+                continue
             base_name = os.path.splitext(os.path.basename(protein_path))[0]
             pdbqt_path = os.path.join(self.paths.structures_dir, f"{base_name}.pdbqt")
             pockets_csv = os.path.join(self.paths.pockets_dir, f"{base_name}.csv")
@@ -726,6 +774,7 @@ class PocketVinaGPU:
                 if not protein_file:
                     continue
 
+                validate_receptor_structure(protein_file)
                 pockets = self.read_database_pockets()
                 if not pockets:
                     continue
@@ -1150,6 +1199,7 @@ class PocketVinaGPU:
     def _process_protein_docking(self, protein_file: str, pockets: List[Dict],
                             batch_folders: List[Tuple[str, int]]) -> None:
         """Process docking for a single protein"""
+        validate_receptor_structure(protein_file)
         top_pockets = getattr(self, "top_pockets", None)
         pockets_to_process = pockets[:top_pockets] if top_pockets else pockets
         if self.config.pockets is not None:
