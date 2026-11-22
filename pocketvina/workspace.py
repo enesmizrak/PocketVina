@@ -308,23 +308,18 @@ def _posebusters(res: Results, rows: pd.DataFrame) -> dict:
 
     import duckdb
 
-    from .io.results import _READ_PARQUET, _sql_list, _sql_str
+    from .io import pb
 
-    # The old dict assignment kept the last physical row of a pose; join output order cannot define that.
-    file_pos = ", ".join(f"({_sql_str(path)}, {n})" for n, path in enumerate(files))
     con = duckdb.connect()
     try:
+        source = pb.source(con, res._posebusters_parts(files))
         con.register("pv_pb_keys", keys)
         checked = con.execute(f"""
             SELECT pb.protein_id, pb.ligand_idx, pb.pocket, pb.mode, pb.pb_status, pb.pb_valid,
                    pb.pb_mask, pb.pb_na_mask, pb.failed_checks
-            FROM read_parquet({_sql_list(files)}, {_READ_PARQUET}, filename = true,
-                              file_row_number = true) AS pb
+            FROM ({source}) AS pb
             JOIN pv_pb_keys AS k ON pb.protein_id = k.protein_id AND pb.ligand_idx = k.ligand_idx
-                AND pb.pocket = k.pocket AND pb.mode = k.mode
-            LEFT JOIN (VALUES {file_pos}) AS f(filename, file_pos) ON f.filename = pb.filename
-            QUALIFY row_number() OVER (PARTITION BY pb.protein_id, pb.ligand_idx, pb.pocket, pb.mode
-                ORDER BY f.file_pos DESC, pb.file_row_number DESC) = 1""").fetchall()
+                AND pb.pocket = k.pocket AND pb.mode = k.mode""").fetchall()
     finally:
         con.close()
 

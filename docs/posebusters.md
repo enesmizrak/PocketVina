@@ -133,6 +133,33 @@ pb[["ligand_id", "pocket", "mode", "pb_status", "failed_checks"]]
 The columns `pb_mask` and `pb_na_mask` store each check as one bit: passed, or no result.
 `Results("results").posebusters_checks("1fbl")` returns the check names in bit order.
 
+Saved checks have one logical record per `(protein_id, ligand_idx, pocket, mode)`. Exact repeated records are
+idempotent and read as one result. Equality compares every persisted column after conversion to the declared
+Arrow types, including configuration, version, masks, runtime and diagnostic text. Null equals null; stored NaN
+equals stored NaN but differs from null. Strings are compared exactly and numbers have no tolerance. Every row
+must name the protein owning its `tables/posebusters/<protein_id>.parquet` part. Negative `no_pose` sentinel keys
+remain valid. A part is the current check set, not a measurement history: rechecks with another version or
+configuration replace it using `--overwrite`.
+
+Conflicting records or a misplaced row raise `pocketvina.io.pb.PoseBustersIntegrityError` (a `ValueError`) when
+reading checks, joining them to pairs, opening DuckDB views or building a results page. The error identifies the
+category, protein, part and one offending key. Validation checks the complete relevant current part even for a
+projected or limited read; unrelated proteins, stale parts and uncommitted parts are excluded. Reads never rewrite
+the saved bytes. `posebusters_checks()` remains a metadata accessor, and pair reads that request no check columns
+remain usable. To diagnose raw records, use `pyarrow.parquet.read_table(path, partitioning=None)`.
+
+An ordinary `bust` resume also reports an integrity error instead of skipping an ambiguous part. Recompute
+explicitly, selecting the intended configuration and pose selection:
+
+```bash
+pocketvina bust --results RESULTS --protein PROTEIN --overwrite --config dock --select best
+```
+
+Successful recomputation atomically replaces that protein's part; failed validation preserves its previous bytes.
+Legacy unique parts without pose-checksum or check-name metadata retain their existing freshness and mask
+semantics. Fresh high-level reads revalidate replacements; reconnect DuckDB after concurrent part replacement.
+Existing live views are not transactional snapshots of multiple files.
+
 You can query the checks with DuckDB. The number of poses with each status:
 
 ```bash

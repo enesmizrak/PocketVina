@@ -345,6 +345,27 @@ Written by `pocketvina bust` or `posebusters=True`. See [PoseBusters checks](pos
 | `failed_checks` | string, null | names of the failed checks, comma-separated |
 | `n_heavy_docked`, `runtime_s`, `error` | int16 null, float32 null, string null | |
 
+The key is `(protein_id, ligand_idx, pocket, mode)`, including legitimate negative `no_pose` sentinel keys.
+Each row must belong to the protein named by its canonical part. Empty parts are allowed. Each part holds the
+current check set, not an append-only measurement history; explicit `bust --overwrite` replaces it for versioned
+or differently configured rechecks. Proteins may have different check definitions.
+
+Exact repeats normalize to one logical record, preserving first-occurrence order in DataFrame reads. Equality
+includes all persisted columns after conversion to the declared Arrow types, including `runtime_s`, `error`,
+`pb_config`, `pb_version` and masks, with exact string/numeric equality and no tolerance. Null equals null and
+stored NaN equals stored NaN; null and NaN differ. Distinct records at the same key or rows in another protein's
+part raise `pocketvina.io.pb.PoseBustersIntegrityError`, a `ValueError` with category, protein, part and one key.
+No record wins by physical order. Relevant current parts are fully validated before projection or page filtering,
+using DuckDB for grouping rather than materializing all checks in Python. Freshness and committed-protein
+filtering precede validation. Reads preserve original bytes, and legacy unique parts without checksum/check-name
+metadata retain their existing freshness and mask semantics.
+
+To recover, run `pocketvina bust --results RESULTS --protein PROTEIN --overwrite` with the intended config/select
+options. Publication validates before replacing the previous part. Check-free pair projections remain available
+for recomputation. For raw diagnosis use `pyarrow.parquet.read_table(path, partitioning=None)`; the normal readers
+and DuckDB views expose normalized records. Reconnect DuckDB after concurrent part replacement: live views do
+not provide a transactional multi-file snapshot.
+
 ## Pose files
 
 `poses/<protein_id>.poses` holds all poses of one protein, in the PVATLAS1 format. Part A has the highest-affinity
