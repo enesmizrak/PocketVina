@@ -18,6 +18,9 @@
 
 ### Fixed
 
+- Atlas JSON and Parquet reads recover malformed cached files with one fresh download per read, validating it
+  before replacing cached bytes. Invalid responses are not published; valid final-release caches remain reusable
+  offline after metadata is read, and local files and supplied digest checks retain their existing behavior.
 - PDB/PDBQT receptors with multiple models or ambiguous model boundaries are rejected before pocket prediction,
   conversion or reuse of completed proteins with readable sources. Extract one receptor model first; ordinary
   single-model preparation and existing results remain compatible.

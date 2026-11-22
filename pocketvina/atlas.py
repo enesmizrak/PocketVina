@@ -678,9 +678,7 @@ class Atlas:
         """HGNC ID -> UniProt accessions, from tables/proteins.parquet (the only file of the release that has HGNC
         IDs; a protein can have several, "HGNC:1;HGNC:2"); read on the first HGNC query."""
         if self._hgnc is None:
-            import pyarrow.parquet as pq
-
-            table = pq.read_table(self.source.file("tables/proteins.parquet"), columns=["uniprot", "hgnc"])
+            table = self.source.parquet("tables/proteins.parquet", columns=["uniprot", "hgnc"])
             hgnc: Dict[str, List[str]] = defaultdict(list)
             for u, h in zip(table.column("uniprot").to_pylist(), table.column("hgnc").to_pylist()):
                 for one in _split(h, ";"):
@@ -844,10 +842,8 @@ class Atlas:
     def _drug_index(self) -> _Drugs:
         """The drug identifiers of the release (read once per Atlas: three small tables of ``tables/``)."""
         if self._drugs is None:
-            import pyarrow.parquet as pq
-
             def read(name: str, columns: List[str]) -> pd.DataFrame:
-                return pq.read_table(self.source.file(f"tables/{name}.parquet"), columns=columns).to_pandas()
+                return self.source.parquet(f"tables/{name}.parquet", columns=columns).to_pandas()
 
             self._drugs = _Drugs(read("compound_entries", _Drugs.ENTRY_COLUMNS),
                                  read("compound_entries_annotated", _Drugs.ANNOTATED_COLUMNS),
@@ -906,9 +902,7 @@ class Atlas:
         if self._drugs is not None:
             return dict(zip(self._drugs.pages["pvl_id"], self._drugs.pages["name"]))
         if self._page_names is None:
-            import pyarrow.parquet as pq
-
-            table = pq.read_table(self.source.file("tables/compounds.parquet"), columns=["pvl_id", "name"])
+            table = self.source.parquet("tables/compounds.parquet", columns=["pvl_id", "name"])
             self._page_names = dict(zip(table.column("pvl_id").to_pylist(), table.column("name").to_pylist()))
         return self._page_names
 
