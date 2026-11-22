@@ -390,6 +390,16 @@ To read the folder by default, set `POCKETVINA_ATLAS` to its full path, for exam
 Files read over the internet are kept in `~/.cache/pocketvina/atlas/` (or `$XDG_CACHE_HOME/pocketvina/atlas/`), so
 the second look is fast. You can delete this folder at any time.
 
+JSON and Parquet downloads are decoded before they enter the cache. If an existing cached file cannot be decoded,
+that read tries one fresh download and keeps it only if decoding succeeds. A bad response, such as a login page,
+raises an error and leaves the previous cache bytes in place; a later call can try again. Valid cached files of a
+final release remain reusable without network after the release metadata has been read.
+
+This recovery applies to remote JSON and Parquet reads. Local release files are never repaired or rewritten.
+Decoding checks the file format, not the meaning or scientific accuracy of valid data, and does not add validation
+to arbitrary binary downloads. Existing size and SHA-256 checks still reject mismatches against supplied release
+digests; recovery does not change the release manifest to accept different data.
+
 ## Citing
 
 If you use the Atlas, cite it as its [citation page](https://pocketvina-atlas.mdc-berlin.de/cite/)

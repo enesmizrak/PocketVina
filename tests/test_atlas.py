@@ -104,6 +104,264 @@ def test_source_json(source, request, tmp_path, monkeypatch):
     assert src.json("search/index.json")["proteins_columns"][0] == "uniprot"
 
 
+@pytest.mark.parametrize("rel,bad", [
+    ("ligand_ids.json", b"<html>login required</html>"),
+    ("ligand_ids.json", b"\xff"),
+    (f"proteins/{ABL1}.json.gz", gzip.compress(b"{}", mtime=0)[:-4]),
+])
+def test_source_json_cache_validation_repairs(rel, bad, atlas_dir, atlas_server, tmp_path, monkeypatch):
+    """Unchecked invalid cache bytes are repaired once and the valid replacement works offline."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    src = Source(atlas_server.url)
+    cached = Path(src.file(rel))
+    good = (atlas_dir / rel).read_bytes()
+    expected = Source(atlas_dir).json(rel)
+    cached.write_bytes(bad)
+    asked = len(atlas_server.requests)
+    assert src.json(rel) == expected
+    assert cached.read_bytes() == good
+    assert [r for r, _ in atlas_server.requests[asked:]] == [rel]
+
+    def offline(*args, **kwargs):
+        pytest.fail("a valid final-release cache entry must work offline")
+
+    monkeypatch.setattr(src, "_request", offline)
+    assert src.json(rel) == expected
+    assert not [p for p in tmp_path.rglob("*") if ".tmp-" in p.name or ".candidate-" in p.name]
+
+
+def test_source_json_cache_validation_rejects_first_response(atlas_dir, tmp_path, http_server, monkeypatch):
+    """An invalid first response is not published; the same Source can recover on a later call."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    release = Path(shutil.copytree(atlas_dir, tmp_path / "release"))
+    rel = "ligand_ids.json"
+    good = (release / rel).read_bytes()
+    (release / rel).write_bytes(b"<html>login required</html>")
+    server = http_server(release)
+    src = Source(server.url)
+    cached = Path(src._cache_path(rel)[0])
+    for attempt in range(2):
+        with pytest.raises(ValueError):
+            src.json(rel)
+        assert not cached.exists()
+        assert [r for r, _ in server.requests].count(rel) == attempt + 1
+    (release / rel).write_bytes(good)
+    assert src.json(rel) == json.loads(good)
+    assert cached.read_bytes() == good
+    assert [r for r, _ in server.requests].count(rel) == 3
+    assert not [p for p in tmp_path.rglob("*") if ".tmp-" in p.name or ".candidate-" in p.name]
+
+
+@pytest.mark.parametrize("consumer,rels", [
+    ("hgnc", ["tables/proteins.parquet"]),
+    ("drugs", [f"tables/{name}.parquet" for name in
+               ("compound_entries", "compound_entries_annotated", "compounds")]),
+    ("names", ["tables/compounds.parquet"]),
+])
+def test_atlas_parquet_cache_validation(consumer, rels, atlas_dir, atlas_server, tmp_path, monkeypatch):
+    """All three Atlas table consumers repair invalid cached Parquet before retaining decoded data."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    atlas = Atlas(atlas_server.url)
+    cached = {rel: Path(atlas.source.file(rel)) for rel in rels}
+    for path in cached.values():
+        path.write_bytes(b"<html>not parquet</html>")
+    asked = len(atlas_server.requests)
+    if consumer == "hgnc":
+        assert atlas.protein("HGNC:76").uniprot == ABL1
+    elif consumer == "drugs":
+        assert atlas.drug(DRUG).pvl == DRUG
+    else:
+        assert atlas._names() == Atlas(atlas_dir)._names()
+    assert [r for r, _ in atlas_server.requests[asked:] if r in rels] == rels
+    for rel, path in cached.items():
+        assert path.read_bytes() == (atlas_dir / rel).read_bytes()
+    asked = len(atlas_server.requests)
+    if consumer == "hgnc":
+        assert atlas._hgnc_ids()
+    elif consumer == "drugs":
+        assert atlas._drug_index()
+    else:
+        assert atlas._names()
+    assert len(atlas_server.requests) == asked
+
+
+@pytest.mark.parametrize("source", ["local", "remote"])
+def test_source_parquet_cache_validation_projection(source, request, atlas_dir, tmp_path, monkeypatch):
+    """Both sources return materialized tables with the requested columns in the requested order."""
+    import pyarrow.parquet as pq
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    src = request.getfixturevalue(source)
+    rel = "tables/proteins.parquet"
+    columns = ["hgnc", "uniprot"]
+    table = src.parquet(rel, columns=columns)
+    assert table.column_names == columns
+    assert table.equals(pq.read_table(atlas_dir / rel, columns=columns))
+    assert src.parquet(rel).equals(pq.read_table(atlas_dir / rel))
+
+
+@pytest.mark.parametrize("reader,rel", [("json", "ligand_ids.json"), ("parquet", "tables/proteins.parquet")])
+def test_source_cache_validation_bounds(reader, rel, atlas_dir, tmp_path, http_server, monkeypatch):
+    """Persistent invalid answers preserve old bytes, with one candidate per call and separate transport retries."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(atlas_source, "RETRY_DELAYS", (0, 0, 0))
+    release = Path(shutil.copytree(atlas_dir, tmp_path / "release"))
+    server = http_server(release)
+    src = Source(server.url)
+    cached = Path(src.file(rel))
+    old = b"invalid old cache"
+    cached.write_bytes(old)
+    (release / rel).write_bytes(b"<html>login required</html>")
+    asked = len(server.requests)
+    server.fail = 1
+    read = getattr(src, reader)
+    for attempt in range(2):
+        with pytest.raises(ValueError, match=rel) as error:
+            read(rel)
+        assert error.value.__cause__ is not None
+        assert cached.read_bytes() == old
+        assert [r for r, _ in server.requests[asked:]] == [rel] * (attempt + 2)
+        assert not [p for p in tmp_path.rglob("*") if ".tmp-" in p.name or ".candidate-" in p.name]
+    good = (atlas_dir / rel).read_bytes()
+    (release / rel).write_bytes(good)
+    value = read(rel)
+    expected = getattr(Source(atlas_dir), reader)(rel)
+    assert value.equals(expected) if reader == "parquet" else value == expected
+    assert cached.read_bytes() == good
+    assert [r for r, _ in server.requests[asked:]] == [rel] * 4
+
+    def offline(*args, **kwargs):
+        pytest.fail("valid final-release data must be reusable offline")
+
+    monkeypatch.setattr(src, "_request", offline)
+    value = read(rel)
+    assert value.equals(expected) if reader == "parquet" else value == expected
+
+
+@pytest.mark.parametrize("reader,rel", [("json", "ligand_ids.json"), ("parquet", "tables/proteins.parquet")])
+def test_source_cache_validation_nonfinal_keeps_good_bytes(reader, rel, atlas_dir, tmp_path, http_server,
+                                                         monkeypatch):
+    """Nonfinal releases fetch each time, but a failed validation never replaces an earlier good file."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    release = Path(shutil.copytree(atlas_dir, tmp_path / "release"))
+    server = http_server(release)
+    src = Source(server.url)
+    src.meta["release"]["status"] = "draft"
+    read = getattr(src, reader)
+    expected = read(rel)
+    cached = Path(src._cache_path(rel)[0])
+    good = cached.read_bytes()
+    (release / rel).write_bytes(b"<html>login required</html>")
+    asked = len(server.requests)
+    with pytest.raises(ValueError, match=rel):
+        read(rel)
+    assert cached.read_bytes() == good
+    assert [r for r, _ in server.requests[asked:]] == [rel]
+    (release / rel).write_bytes(good)
+    value = read(rel)
+    assert value.equals(expected) if reader == "parquet" else value == expected
+    assert [r for r, _ in server.requests[asked:]] == [rel, rel]
+    assert not [p for p in tmp_path.rglob("*") if ".tmp-" in p.name or ".candidate-" in p.name]
+
+
+@pytest.mark.parametrize("reader,rel", [("json", "ligand_ids.json"), ("parquet", "tables/proteins.parquet")])
+def test_source_cache_validation_local_is_never_repaired(reader, rel, atlas_dir, tmp_path, monkeypatch):
+    """Invalid or missing local files propagate errors without fetching, caching or modifying user data."""
+    import pyarrow as pa
+
+    release = Path(shutil.copytree(atlas_dir, tmp_path / "release"))
+    src = Source(release)
+
+    def no_fetch(*args, **kwargs):
+        pytest.fail("a local source must never download or copy a replacement")
+
+    monkeypatch.setattr(src, "copy", no_fetch)
+    monkeypatch.setattr(src, "_request", no_fetch)
+    bad = b"<html>not structured data</html>"
+    (release / rel).write_bytes(bad)
+    read = getattr(src, reader)
+    with pytest.raises(pa.ArrowInvalid if reader == "parquet" else json.JSONDecodeError):
+        read(rel)
+    assert (release / rel).read_bytes() == bad
+    (release / rel).unlink()
+    with pytest.raises(FileNotFoundError, match=rel):
+        read(rel)
+    assert not (release / rel).exists()
+
+
+@pytest.mark.parametrize("error", [PermissionError("denied"), NotImplementedError("unsupported feature")])
+def test_source_cache_validation_environment_errors_do_not_fetch(error, atlas_server, tmp_path, monkeypatch):
+    """Reader failures outside the explicit format-error set do not trigger repair or remove cached data."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    src = Source(atlas_server.url)
+    rel = "ligand_ids.json"
+    cached = Path(src.file(rel))
+    good = cached.read_bytes()
+    asked = len(atlas_server.requests)
+
+    def read(filename):
+        assert filename == str(cached)
+        raise error
+
+    with pytest.raises(type(error)) as raised:
+        src._read_structured(rel, read, (json.JSONDecodeError,))
+    assert raised.value is error
+    assert cached.read_bytes() == good and len(atlas_server.requests) == asked
+
+
+@pytest.mark.parametrize("reader,rel", [("json", "ligand_ids.json"), ("parquet", "tables/proteins.parquet")])
+def test_source_cache_validation_redirect_rejects_invalid_data(reader, rel, atlas_dir, tmp_path, http_server,
+                                                              monkeypatch):
+    """A real redirect to invalid HTTP-200 content cannot publish a structured cache entry."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    release = Path(shutil.copytree(atlas_dir, tmp_path / "release"))
+    (release / rel).write_bytes(b"<html>login required</html>")
+    server = http_server(release)
+    src = Source(server.url)
+    cached = Path(src._cache_path(rel)[0])
+    src._base = server.url + "moved/"
+    asked = len(server.requests)
+    with pytest.raises(ValueError, match=rel):
+        getattr(src, reader)(rel)
+    assert [r for r, _ in server.requests[asked:]] == ["moved/" + rel, rel]
+    assert not cached.exists()
+    assert not [p for p in tmp_path.rglob("*") if ".tmp-" in p.name or ".candidate-" in p.name]
+
+
+def test_source_json_cache_validation_accepts_any_valid_json(atlas_dir, tmp_path, http_server, monkeypatch):
+    """Format validation deliberately leaves JSON domain-schema validation to Atlas consumers."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    release = Path(shutil.copytree(atlas_dir, tmp_path / "release"))
+    rel = "ligand_ids.json"
+    (release / rel).write_bytes(b"[1, null, true]")
+    src = Source(http_server(release).url)
+    assert src.json(rel) == [1, None, True]
+    assert Path(src._cache_path(rel)[0]).read_bytes() == b"[1, null, true]"
+
+
+def test_source_json_cache_validation_transport_failure_keeps_old_bytes(atlas_server, tmp_path, monkeypatch):
+    """A network failure while repairing invalid cache data is not hidden or treated as another parse error."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    src = Source(atlas_server.url)
+    rel = "ligand_ids.json"
+    cached = Path(src.file(rel))
+    bad = b"<html>old invalid bytes</html>"
+    cached.write_bytes(bad)
+    attempts = []
+    error = ConnectionError("synthetic offline connection")
+
+    def offline(*args, **kwargs):
+        attempts.append(args[0])
+        raise error
+
+    monkeypatch.setattr(src, "_request", offline)
+    with pytest.raises(ConnectionError) as raised:
+        src.json(rel)
+    assert raised.value is error and attempts == [rel]
+    assert cached.read_bytes() == bad
+    assert not [p for p in tmp_path.rglob("*") if ".tmp-" in p.name or ".candidate-" in p.name]
+
+
 @pytest.mark.parametrize("source", ["local", "remote"])
 def test_source_range(source, request, atlas_dir, tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))

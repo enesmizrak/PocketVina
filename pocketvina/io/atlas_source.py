@@ -27,11 +27,13 @@ import os
 import re
 import ssl
 import struct
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from collections import deque
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -142,10 +144,54 @@ class Source:
             rel += ".gz"
         if rel == "meta.json":
             return self.meta
-        data = self._read_local(rel) if self.path is not None else self._read_cached(rel)
-        if data[:2] == b"\x1f\x8b":
-            data = gzip.decompress(data)
-        return json.loads(data)
+        def read(filename):
+            with open(filename, "rb") as f:
+                data = f.read()
+            if data[:2] == b"\x1f\x8b":
+                data = gzip.decompress(data)
+            return json.loads(data)
+
+        return self._read_structured(rel, read, (json.JSONDecodeError, UnicodeDecodeError, gzip.BadGzipFile,
+                                                 EOFError, zlib.error))
+
+    def parquet(self, path: str, columns=None):
+        """A materialized Parquet table, optionally projected to ``columns`` (used by Atlas table readers)."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        return self._read_structured(_rel(path), lambda filename: pq.read_table(filename, columns=columns),
+                                     (pa.ArrowInvalid,))
+
+    def _read_structured(self, rel: str, read: Callable, format_errors: Tuple[type, ...]):
+        """Fully decode a local file or a validated HTTP candidate before publishing it in the cache.
+
+        ``read(filename)`` must return a materialized value, without retaining an open file. Only explicit format
+        errors permit one fresh fetch after an invalid reusable cache entry; I/O and transport errors propagate.
+        Local releases are read as supplied and never repaired. A failed candidate leaves existing bytes intact.
+        """
+        if self.path is not None:
+            return read(self._local(rel))
+        target, reuse = self._cache_path(rel)
+        if reuse and os.path.isfile(target):
+            try:
+                return read(target)
+            except format_errors:
+                pass
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        fd, candidate = tempfile.mkstemp(prefix=os.path.basename(target) + ".candidate-",
+                                         dir=os.path.dirname(target))
+        os.close(fd)
+        try:
+            self.copy(rel, candidate)
+            try:
+                value = read(candidate)
+            except format_errors as e:
+                raise ValueError(f"{self.location}: {rel} has invalid structured data") from e
+            os.replace(candidate, target)
+            return value
+        finally:
+            if os.path.exists(candidate):
+                os.unlink(candidate)
 
     def file(self, path: str, size: Optional[int] = None, sha256: Optional[str] = None) -> str:
         """A whole file of the release as a local path, e.g. "structures/AF-P00519-F1-model_v6.pdb.gz": the file
