@@ -78,6 +78,28 @@ clinfo -l
 
 The first run on a GPU compiles the engine's GPU code. This takes a few seconds, once.
 
+## Receptor inputs
+
+Supply one receptor structure per input file. PDB and PDBQT inputs may contain no model markers, or one matched
+`MODEL`/`ENDMDL` pair with all `ATOM`/`HETATM` records inside it. This applies to gzip-compressed inputs too.
+Multiple models are rejected even if their model labels repeat. Unclosed, nested or stray model boundaries and
+atom records outside an explicit model are also rejected. Extract one receptor model into a separate input file
+before running PocketVina; no model is selected automatically.
+
+For engine-bound PDBQT, PocketVina uses LF newlines and removes the `MODEL`/`ENDMDL` wrappers of a validated
+single model. The engine cannot read those tags or blank CRLF records without newline normalization. All other
+record content and atom order are preserved; an implicit LF receptor passes through unchanged. Original source
+files and staged sources keep their bytes, including wrappers and line endings, and source fingerprints still
+hash the original contents. Cached or database receptors needing wrapper or newline normalization use a private
+temporary copy with the same basename, removed after docking.
+
+This check runs before pocket prediction, receptor conversion and reuse of completed proteins with readable
+PDB/PDBQT sources, in both atlas and legacy files workflows. Existing results remain readable.
+
+mmCIF inputs still use OpenBabel's existing parser and conversion behavior. Any model markers retained in its
+PDB conversion are checked, but this does not establish a model-selection policy for mmCIF ensembles. Extract the
+intended structure before supplying an mmCIF ensemble.
+
 ## Google Colab
 
 Open the

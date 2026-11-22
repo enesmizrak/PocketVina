@@ -69,6 +69,7 @@ from .main import (  # receptor_pdbqt is in main.py so that the "files" format n
     read_structure,
     receptor_pdbqt,
     structure_kind,
+    validate_receptor_structure,
 )
 from .pdbqt import parse_modes
 
@@ -204,6 +205,8 @@ def _check_resume_identity(prot: ProteinInput, manifest_path: str) -> bool:
         if not isinstance(summary, dict):
             raise ValueError("malformed summary")
         if "input_identity" not in summary:
+            if os.path.exists(prot.source_path):
+                validate_receptor_structure(prot.source_path)
             return False
         saved = summary["input_identity"]
         if not isinstance(saved, dict):
@@ -219,7 +222,9 @@ def _check_resume_identity(prot: ProteinInput, manifest_path: str) -> bool:
                 raise ValueError(f"malformed input_identity {key}")
         if saved.get("pocket_source") not in ("supplied", "predicted"):
             raise ValueError("malformed input_identity pocket_source")
-        changes = _identity_changes(saved, _input_identity(prot))
+        current = _input_identity(prot)
+        validate_receptor_structure(prot.source_path)
+        changes = _identity_changes(saved, current)
         if changes:
             raise ValueError(f"changed {changes}")
     except (OSError, ValueError, KeyError, TypeError) as e:
@@ -286,6 +291,7 @@ def predict_pockets(structure, work_dir, p2rank_config: Optional[P2RankConfig] =
     ``p2rank.ensure_p2rank()``, downloaded into the user cache first if there is none. ``RunAborted`` if P2Rank or
     Java cannot be started, ``RuntimeError`` if the prediction fails.
     """
+    validate_receptor_structure(structure)
     cfg = p2rank_config or P2RankConfig()
     work_dir = os.path.abspath(os.fspath(work_dir))
     out_dir = os.path.join(work_dir, "out")
@@ -1122,6 +1128,7 @@ def _prepare_protein(pv: PocketVinaGPU, n: int, prot: ProteinInput, lig: _Ligand
     t0 = time.monotonic()
     if not os.path.isfile(prot.source_path):
         raise FileNotFoundError(f"structure not found: {prot.source_path}")
+    validate_receptor_structure(prot.source_path)
     input_identity = _input_identity(prot)
     pockets_csv = prot.pockets_csv or predict_pockets(prot.source_path, os.path.join(work, "p2rank"),
                                                       cfg.p2rank_config, while_running=while_running)

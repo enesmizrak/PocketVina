@@ -18,6 +18,11 @@
 
 ### Fixed
 
+- PDB/PDBQT receptors with multiple models or ambiguous model boundaries are rejected before pocket prediction,
+  conversion or reuse of completed proteins with readable sources. Extract one receptor model first; ordinary
+  single-model preparation and existing results remain compatible.
+  Engine-bound PDBQT uses LF newlines and has validated single-model wrappers removed, including legacy cached
+  and database receptors. Atom content/order, original source bytes and source-content fingerprints are preserved.
 - Interrupted atlas initialization recovers the exact elected prepared ligands from a retained immutable snapshot,
   preserving unseeded coordinates and safe selection among concurrent starters.
 - Repeated PoseBusters protein-load failures are bounded per protein independently of the number of poses.

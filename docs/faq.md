@@ -20,6 +20,24 @@ and all others are prepared and docked.
 For newly computed results, PocketVina verifies the structure and supplied pocket CSV contents before skipping.
 Moving identical inputs or changing only gzip metadata is harmless. Older or imported results without stored input
 identity are still skipped, with one warning per invocation that their identity could not be verified.
+Readable PDB/PDBQT sources must still satisfy the single-model receptor policy below.
+
+### Why does my receptor fail with "extract one receptor model first"?
+
+PocketVina accepts PDB/PDBQT receptors with no model markers or one matched `MODEL`/`ENDMDL` pair containing all
+atom records, including gzipped files. Two or more models, repeated model labels, malformed boundaries and atoms
+outside an explicit model are rejected before pocket prediction, conversion or completed-protein reuse.
+Extract the one receptor model you intend to dock into a separate file and use that file as input. PocketVina
+does not choose the first model or dock an ensemble. Stored results can still be read without preparing inputs.
+
+The engine cannot read `MODEL`/`ENDMDL` tags or unnormalized blank CRLF records in a receptor. PocketVina normalizes
+engine-bound PDBQT newlines to LF and removes those wrappers after validating the single model. Other record
+content and atom order are preserved. Your source file, staged original and source-content fingerprint stay
+unchanged. Legacy cached and database PDBQTs use a temporary same-basename copy whenever wrappers or CR/CRLF
+newlines need normalization; that copy is removed after docking. Implicit LF receptors remain unchanged.
+
+The check uses PDB/PDBQT model boundaries; it does not resolve mmCIF ensemble selection. mmCIF still follows
+OpenBabel's parser behavior, with a boundary check on any markers retained in converted PDB output.
 
 ### I changed a receptor or its supplied pocket centres
 

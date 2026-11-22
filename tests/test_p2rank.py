@@ -4,6 +4,7 @@
 Nothing here downloads the real release: a small stand-in archive with the same layout (``p2rank_2.5.1/prank``, ...)
 is served from a ``file://`` URL, with ``P2RANK_SHA256`` patched to its digest. Java is a fake ``java`` script.
 """
+import gzip
 import hashlib
 import io
 import logging
@@ -408,6 +409,29 @@ def test_predict_pockets_without_p2rank_stops_the_run(env, release, monkeypatch,
     monkeypatch.setattr(p2rank, "P2RANK_SHA256", "0" * 64)  # the download fails
     with pytest.raises(pipeline.RunAborted, match="damaged"):
         pipeline.predict_pockets(example_dir / "proteins" / "1fbl.pdb", env / "work")
+
+
+@pytest.mark.parametrize("suffix", [".pdb", ".pdbqt", ".pdb.gz", ".pdbqt.gz"])
+def test_receptor_model_rejected_before_p2rank_discovery(tmp_path, suffix, monkeypatch, caplog):
+    source = tmp_path / ("ensemble" + suffix)
+    text = "MODEL        1\r\nENDMDL\r\nMODEL        1\r\nENDMDL\r\n".encode()
+    source.write_bytes(gzip.compress(text) if suffix.endswith(".gz") else text)
+
+    def forbidden():
+        pytest.fail("rejected receptor reached P2Rank discovery")
+
+    monkeypatch.setattr(p2rank, "ensure_p2rank", forbidden)
+    with pytest.raises(ValueError, match="extract one receptor model"):
+        pipeline.predict_pockets(source, tmp_path / "atlas")
+    proc = P2RankProcessor(P2RankConfig(output_dir=str(tmp_path / "files")))
+    assert not proc.run_p2rank(str(source))
+    assert proc.process_pdb_file(str(source)) is None
+    # Even a cached prepared receptor/pocket pair cannot bypass source validation.
+    base = os.path.splitext(source.name)[0]
+    Path(proc.structures_dir, base + ".pdbqt").write_text("cached")
+    Path(proc.pockets_dir, base + ".csv").write_text("cached")
+    assert proc.process_file_list([str(source)]) == {str(source): False}
+    assert "extract one receptor model" in caplog.text
 
 
 def test_predict_pockets_downloads_p2rank_and_runs_it(env, release, monkeypatch, example_dir, downloads):
