@@ -12,6 +12,8 @@
 
 ### Changed
 
+- Results pages materialize PoseBusters checks only for the displayed highest-affinity poses, including an
+  explicitly selected ligand beyond the page limit, reducing Python processing and memory use for check records.
 - Clarified atlas `dock --force` help and documentation: replacing the run definition retains completed proteins
   when the ordered ligand IDs and input SMILES are unchanged. A new output directory is required to recompute
   every requested protein with new settings or changed inputs; force does not guarantee full recomputation or cleanup.

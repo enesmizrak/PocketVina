@@ -28,7 +28,7 @@ import pytest
 from pocketvina import PocketVinaConfig, PocketVinaGPU, pdbqt, workspace
 from pocketvina.bust import _protein_pdb
 from pocketvina.io.importer import import_legacy
-from pocketvina.io.results import Results, short_floats
+from pocketvina.io.results import PB_CHECKS_META, PB_POSES_META, Results, short_floats
 from pocketvina.selection import name_part
 from test_io_results import PID2, add_receptor_copy, write_pb_part
 
@@ -130,6 +130,23 @@ def old_listing(res, pids, max_ligands, selection=None) -> dict:
     return out
 
 
+def old_posebusters(res, pids) -> dict:
+    """The workspace's previous full-table reader, including last physical row wins for duplicate poses."""
+    out = {}
+    for pid in pids:
+        df = res.posebusters(pid)
+        if df.empty:
+            continue
+        n = len(res.posebusters_checks(pid))
+        for r in df.itertuples(index=False):
+            out[(pid, int(r.ligand_idx), int(r.pocket), int(r.mode))] = {
+                "status": r.pb_status, "valid": None if pd.isna(r.pb_valid) else bool(r.pb_valid),
+                "passed": bin(int(r.pb_mask)).count("1"),
+                "total": max(n - bin(int(r.pb_na_mask)).count("1"), 0),
+                "failed": r.failed_checks.split(",") if isinstance(r.failed_checks, str) and r.failed_checks else []}
+    return out
+
+
 def listing(data) -> dict:
     return {p["id"]: (p["n"], p["docked"], [(r["lig"], r["vina"], r["pocket"], r["mode"], r["le"], r["rank"],
                                             r["across"], [k["rank"] for k in r["pockets"]]) for r in p["rows"]])
@@ -198,7 +215,7 @@ def test_data_of_several_proteins_with_posebusters_only_where_checked(two):
     # the same scores on both proteins: ties by protein id
     assert across == {(PID2, "molecule2"): [1, 2], (PID, "molecule2"): [2, 2], (PID2, "molecule5"): [1, 2],
                       (PID, "molecule5"): [2, 2]}
-    stored = two.posebusters(columns=["protein_id", "ligand_id", "pocket", "mode", "pb_status", "failed_checks"])
+    stored = two.posebusters()
     checked = {(r.protein_id, r.ligand_id, int(r.pocket), int(r.mode)): r for r in stored.itertuples(index=False)}
     assert checked  # the fixture holds checks of one protein
     for p in data["proteins"]:
@@ -208,10 +225,11 @@ def test_data_of_several_proteins_with_posebusters_only_where_checked(two):
             if ref is None:
                 assert r["pb"] is None
             else:
-                pb = r["pb"]
-                assert set(pb) == {"status", "valid", "passed", "total", "failed"} and pb["status"] == ref.pb_status
-                assert 0 <= pb["passed"] <= pb["total"] and len(pb["failed"]) == (len(ref.failed_checks.split(","))
-                                                                                  if ref.failed_checks else 0)
+                assert r["pb"] == {
+                    "status": ref.pb_status, "valid": None if pd.isna(ref.pb_valid) else bool(ref.pb_valid),
+                    "passed": bin(int(ref.pb_mask)).count("1"),
+                    "total": max(len(two.posebusters_checks(p["id"])) - bin(int(ref.pb_na_mask)).count("1"), 0),
+                    "failed": ref.failed_checks.split(",") if ref.failed_checks else []}
     assert any(r["pb"] for p in data["proteins"] for r in p["rows"])
     for lig in data["ligands"].values():
         assert set(lig) == {"id", "smiles", "docked", "inchikey", "svg", "name"} and lig["inchikey"] and lig["docked"]
@@ -223,6 +241,211 @@ def test_data_of_several_proteins_with_posebusters_only_where_checked(two):
     extra = workspace.workspace_data(two, [PID], max_ligands=1, selection=sel)
     assert [(r["lig"], r["rank"]) for r in extra["proteins"][0]["rows"]] == [(0, 1), (1, 2)]
     assert set(extra["ligands"]) == {"0", "1"}
+    expected = {r["lig"]: r["pb"] for p in data["proteins"] if p["id"] == PID for r in p["rows"]}
+    for page in (one, extra, workspace.workspace_data(two, [PID], max_ligands=None)):
+        assert {r["lig"]: r["pb"] for r in page["proteins"][0]["rows"]} == {
+            r["lig"]: expected[r["lig"]] for r in page["proteins"][0]["rows"]}
+
+
+def test_pb_filter_keys(two):
+    rows = workspace._listed(two, [PID, PID2], 1, None)[0]
+    # Duplicate display keys must not multiply results; a different mode is unchecked.
+    rows = pd.concat([rows, rows], ignore_index=True)
+    assert workspace._posebusters(two, rows) == {
+        (PID, 0, 2, 1): dict(status="valid", valid=True, passed=0, total=0, failed=[])}
+    rows["best_mode"] = 99
+    assert workspace._posebusters(two, rows) == {}
+
+
+def test_pb_filter_empty_keys(two, monkeypatch):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("empty keys must not read PoseBusters parts")
+
+    monkeypatch.setattr(two, "_posebusters_files", unexpected)
+    columns = ["protein_id", "ligand_idx", "best_pocket", "best_mode"]
+    assert workspace._posebusters(two, pd.DataFrame(columns=columns)) == {}
+    invalid = pd.DataFrame([(PID, 0, None, 1), (PID, 0, -1, 1), (PID, 0, 2, 0),
+                            (None, 0, 2, 1), (PID, -1, 2, 1)], columns=columns)
+    assert workspace._posebusters(two, invalid) == {}
+
+
+def test_pb_filter_materializes_only_requested_checks(two, tmp_path, monkeypatch):
+    import duckdb
+
+    path = tmp_path / "results"
+    shutil.copytree(two.path, path)
+    with Results(path) as r:
+        expected_page = workspace.workspace_data(r, max_ligands=1)
+        rows = workspace._listed(r, r.proteins(), 1, None)[0]
+        rows = pd.concat([rows, rows], ignore_index=True)
+        wanted = {(PID, 0, 2, 1): dict(status="valid", valid=True, passed=0, total=0, failed=[])}
+        extra = [(i, f"extra{i}", 2, 1, "invalid", False) for i in range(1000, 6000)]
+        # The same ligand at another pocket or mode, and in another protein, must not leak into the mapping.
+        write_pb_part(path, PID, [(0, "molecule2", 2, 1, "valid", True),
+                                 (1, "molecule5", 1, 1, "invalid", False),
+                                 (0, "molecule2", 1, 1, "invalid", False),
+                                 (0, "molecule2", 2, 2, "invalid", False)] + extra)
+        write_pb_part(path, PID2, [(1, "molecule5", 2, 1, "invalid", False)] + extra)
+
+        def whole_table(*args, **kwargs):
+            raise AssertionError("workspace must not materialize the whole PoseBusters table")
+
+        monkeypatch.setattr(r, "posebusters", whole_table)
+        connect = duckdb.connect
+        fetched, closed = [], []
+
+        class Connection:
+            def __init__(self):
+                self.con = connect()
+
+            def register(self, name, frame):
+                assert name == "pv_pb_keys" and len(frame) == 2
+                assert all(frame[c].dtype == np.dtype("int64") for c in ("ligand_idx", "pocket", "mode"))
+                self.con.register(name, frame)
+
+            def execute(self, query):
+                self.con.execute(query)
+                return self
+
+            def fetchall(self):
+                result = self.con.fetchall()
+                fetched.append(len(result))
+                return result
+
+            def close(self):
+                self.con.close()
+                closed.append(True)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(duckdb, "connect", Connection)
+            assert workspace._posebusters(r, rows) == wanted
+        assert fetched == [1] and closed == [True]
+        assert workspace.workspace_data(r, max_ligands=1) == expected_page
+
+
+def test_pb_filter_conflicting_duplicates_keep_last_physical_row(two, tmp_path, monkeypatch):
+    path = tmp_path / "results"
+    shutil.copytree(two.path, path)
+    checks = [(0, "molecule2", 2, 1, "valid", True), (1, "molecule5", 1, 1, "invalid", False)]
+    for i in range(1000, 51000):
+        checks.append((i, f"extra{i}", 2, 1, "invalid", False))
+        if i % 257 == 0:
+            checks.extend([(0, "molecule2", 2, 1, "invalid", False),
+                           (1, "molecule5", 1, 1, "valid", True)])
+    checks.extend([(0, "molecule2", 2, 1, "timeout", None), (1, "molecule5", 1, 1, "error", None)])
+    part = write_pb_part(path, PID, checks)
+    table = pq.read_table(part)
+    pq.write_table(table, part, row_group_size=128)
+    assert pq.ParquetFile(part).metadata.num_row_groups > 300
+    other = write_pb_part(tmp_path / "other's results", PID,
+                          [(0, "molecule2", 2, 1, "valid", True), (1, "molecule5", 1, 1, "invalid", False)])
+    with Results(path) as r:
+        rows = workspace._listed(r, [PID], None, None)[0]
+        wanted = {(PID, int(row.ligand_idx), int(row.best_pocket), int(row.best_mode))
+                  for row in rows.itertuples(index=False)}
+
+        def whole_table(*args, **kwargs):
+            raise AssertionError("workspace must join before fetching duplicate check records")
+
+        # Normally one part per protein; explicit file order must also win over row numbers across parts.
+        for files in ([str(part)], [str(part), str(other)], [str(other), str(part)]):
+            with monkeypatch.context() as patch:
+                patch.setattr(r, "_posebusters_files", lambda protein, files=files: files)
+                expected = old_posebusters(r, [PID])
+                expected = {key: expected[key] for key in wanted}
+                assert (expected[(PID, 0, 2, 1)]["status"], expected[(PID, 1, 1, 1)]["status"]) == (
+                    ("timeout", "error") if files[-1] == str(part) else ("valid", "invalid"))
+                patch.setattr(r, "posebusters", whole_table)
+                assert workspace._posebusters(r, rows) == expected
+                data = workspace.workspace_data(r, [PID], max_ligands=None)
+                assert {(PID, row["lig"], row["pocket"], row["mode"]): row["pb"]
+                        for row in data["proteins"][0]["rows"]} == expected
+
+
+@pytest.mark.parametrize("failure", ["register", "execute", "fetchall"])
+def test_pb_filter_closes_connection_on_failure(two, monkeypatch, failure):
+    import duckdb
+
+    rows = workspace._listed(two, [PID], 1, None)[0]
+    closed = []
+
+    class Connection:
+        def register(self, *args):
+            if failure == "register":
+                raise RuntimeError("registration failed")
+
+        def execute(self, *args):
+            if failure == "execute":
+                raise RuntimeError("query failed")
+            return self
+
+        def fetchall(self):
+            raise RuntimeError("fetch failed")
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(duckdb, "connect", Connection)
+    with pytest.raises(RuntimeError):
+        workspace._posebusters(two, rows)
+    assert closed == [True]
+
+
+def test_pb_filter_per_protein_checks_and_masks(two, tmp_path):
+    path = tmp_path / "run=1"
+    shutil.copytree(two.path, path)
+    definitions = {PID: ["first", "second", "third", "fourth"], PID2: ["only", "other"]}
+    details = {PID: ([5, 1], [8, 14], ["second", None]), PID2: ([1, 0], [0, 3], ["other", ""])}
+    for pid in (PID, PID2):
+        part = write_pb_part(path, pid, [(0, "molecule2", 2, 1, "invalid", False),
+                                         (1, "molecule5", 1, 1 if pid == PID else 2, "timeout", None)])
+        table = pq.read_table(part)
+        for column, values in zip(("pb_mask", "pb_na_mask", "failed_checks"), details[pid]):
+            field = table.schema.field(column)
+            table = table.set_column(table.schema.get_field_index(column), field, pa.array(values, type=field.type))
+        pq.write_table(table.replace_schema_metadata({**(table.schema.metadata or {}),
+                                                      PB_CHECKS_META: json.dumps(definitions[pid]).encode()}), part)
+    expected = {
+        (PID, 0): dict(status="invalid", valid=False, passed=2, total=3, failed=["second"]),
+        (PID, 1): dict(status="timeout", valid=None, passed=1, total=1, failed=[]),
+        (PID2, 0): dict(status="invalid", valid=False, passed=1, total=2, failed=["other"]),
+        (PID2, 1): None}  # Another mode was checked, not the displayed best pose.
+    with Results(path) as r:
+        for limit, selection in ((None, None), (1, None), (1, r.select(PID, "molecule5"))):
+            data = workspace.workspace_data(r, max_ligands=limit, selection=selection)
+            got = {(p["id"], row["lig"]): row["pb"] for p in data["proteins"] for row in p["rows"]}
+            assert got == {key: expected[key] for key in got}
+            assert len(got) == (4 if limit is None else 3 if selection is not None else 2)
+            assert workspace.page_payload(workspace.workspace_html(data)) == data
+            json.dumps(data, allow_nan=False)
+
+
+@pytest.mark.parametrize("state", ["missing", "stale"])
+def test_pb_filter_missing_or_stale_parts(two, tmp_path, monkeypatch, state):
+    path = tmp_path / "run=1"
+    shutil.copytree(two.path, path)
+    part = path / "tables" / "posebusters" / f"{PID}.parquet"
+    if state == "missing":
+        part.unlink()
+    else:
+        table = pq.read_table(part)
+        pq.write_table(table.replace_schema_metadata({**(table.schema.metadata or {}),
+                                                      PB_POSES_META: b"0" * 64}), part)
+        # A current part for another protein must still be queried when one part is stale.
+        write_pb_part(path, PID2, [(0, "molecule2", 2, 1, "valid", True)])
+    with Results(path) as r:
+        check_names = r.posebusters_checks
+
+        def current_names(pid):
+            assert state == "stale" and pid == PID2, "unavailable definitions must not be requested"
+            return check_names(pid)
+
+        monkeypatch.setattr(r, "posebusters_checks", current_names)
+        data = workspace.workspace_data(r, max_ligands=None)
+        got = {(p["id"], row["lig"]): row["pb"] for p in data["proteins"] for row in p["rows"]}
+        assert got[(PID, 0)] is None and got[(PID, 1)] is None and got[(PID2, 1)] is None
+        assert got[(PID2, 0)] == (dict(status="valid", valid=True, passed=0, total=0, failed=[])
+                                 if state == "stale" else None)
 
 
 def test_data_has_the_sas_points_where_the_results_have_them(two, monkeypatch):
