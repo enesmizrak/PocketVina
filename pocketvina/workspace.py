@@ -292,22 +292,52 @@ def _listed(res: Results, pids: Sequence[str], max_ligands: Optional[int], selec
     return rows[_ROW_COLUMNS], n, docked, with_pose, ligands
 
 
-def _posebusters(res: Results, pids: Sequence[str]) -> dict:
-    """The PoseBusters results the run holds (``bust.bust_results``; none if it was not run, as PoseBusters is
-    optional): {(protein, ligand_idx, pocket, mode): {status, valid, passed, total, failed}}."""
+def _posebusters(res: Results, rows: pd.DataFrame) -> dict:
+    """PoseBusters results of the listed best poses (none where checks were not run):
+    {(protein, ligand_idx, pocket, mode): {status, valid, passed, total, failed}}."""
+    keys = rows[["protein_id", "ligand_idx", "best_pocket", "best_mode"]].rename(
+        columns={"best_pocket": "pocket", "best_mode": "mode"}).dropna()
+    keys = keys[(keys["ligand_idx"] >= 0) & (keys["pocket"] >= 1) & (keys["mode"] >= 1)]
+    if keys.empty:
+        return {}
+    keys = keys.astype({"protein_id": str, "ligand_idx": "int64", "pocket": "int64", "mode": "int64"})
+    keys = keys.drop_duplicates()
+    files = res._posebusters_files(keys["protein_id"].drop_duplicates().tolist())
+    if not files:
+        return {}
+
+    import duckdb
+
+    from .io.results import _READ_PARQUET, _sql_list, _sql_str
+
+    # The old dict assignment kept the last physical row of a pose; join output order cannot define that.
+    file_pos = ", ".join(f"({_sql_str(path)}, {n})" for n, path in enumerate(files))
+    con = duckdb.connect()
+    try:
+        con.register("pv_pb_keys", keys)
+        checked = con.execute(f"""
+            SELECT pb.protein_id, pb.ligand_idx, pb.pocket, pb.mode, pb.pb_status, pb.pb_valid,
+                   pb.pb_mask, pb.pb_na_mask, pb.failed_checks
+            FROM read_parquet({_sql_list(files)}, {_READ_PARQUET}, filename = true,
+                              file_row_number = true) AS pb
+            JOIN pv_pb_keys AS k ON pb.protein_id = k.protein_id AND pb.ligand_idx = k.ligand_idx
+                AND pb.pocket = k.pocket AND pb.mode = k.mode
+            LEFT JOIN (VALUES {file_pos}) AS f(filename, file_pos) ON f.filename = pb.filename
+            QUALIFY row_number() OVER (PARTITION BY pb.protein_id, pb.ligand_idx, pb.pocket, pb.mode
+                ORDER BY f.file_pos DESC, pb.file_row_number DESC) = 1""").fetchall()
+    finally:
+        con.close()
+
     out = {}
-    for pid in pids:
-        df = res.posebusters(pid, columns=["ligand_idx", "pocket", "mode", "pb_status", "pb_valid", "pb_mask",
-                                           "pb_na_mask", "failed_checks"])
-        if df.empty:
-            continue
-        n = len(res.posebusters_checks(pid))
-        for r in df.itertuples(index=False):
-            answered = n - bin(int(r.pb_na_mask)).count("1")
-            out[(pid, int(r.ligand_idx), int(r.pocket), int(r.mode))] = {
-                "status": r.pb_status, "valid": None if pd.isna(r.pb_valid) else bool(r.pb_valid),
-                "passed": bin(int(r.pb_mask)).count("1"), "total": max(answered, 0),
-                "failed": r.failed_checks.split(",") if isinstance(r.failed_checks, str) and r.failed_checks else []}
+    counts = {}
+    for pid, i, k, m, status, valid, mask, na_mask, failed in checked:
+        if pid not in counts:
+            counts[pid] = len(res.posebusters_checks(pid))
+        answered = counts[pid] - bin(int(na_mask)).count("1")
+        out[(pid, int(i), int(k), int(m))] = {
+            "status": status, "valid": None if pd.isna(valid) else bool(valid),
+            "passed": bin(int(mask)).count("1"), "total": max(answered, 0),
+            "failed": failed.split(",") if isinstance(failed, str) and failed else []}
     return out
 
 
@@ -325,7 +355,7 @@ def workspace_data(res: Results, proteins: Optional[Sequence[str]] = None, *, ma
     if not pids:
         raise ValueError(f"no docked protein in {res.path} yet")
     rows, n_of, docked_of, with_pose, lig = _listed(res, pids, max_ligands, selection)
-    checks = _posebusters(res, pids)
+    checks = _posebusters(res, rows)
     rows["ligand_efficiency"] = res._ligand_efficiency(rows)
     rows["vina"] = short_floats(rows["vina"])
     by_protein = {pid: g for pid, g in rows.groupby("protein_id", sort=False)}
